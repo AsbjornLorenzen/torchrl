@@ -56,7 +56,6 @@ class GNNActor(nn.Module):
         self,
         n_agent_inputs: int,
         n_agent_outputs: int,
-        n_agents: int,
         gnn_hidden_dim: int = 128,
         n_gnn_layers: int = 2,
         activation_class=nn.Tanh,
@@ -70,7 +69,6 @@ class GNNActor(nn.Module):
         if not _has_pyg:
             raise ImportError("PyTorch Geometric is required for GNNActor.")
 
-        self.n_agents = n_agents
         self.n_agent_inputs = n_agent_inputs
         self.n_agent_outputs = n_agent_outputs
         self.k_neighbours = k_neighbours
@@ -172,8 +170,7 @@ class GNNActor(nn.Module):
         if batch_size == 0 or n_agents == 0: # Handle empty batch/no agents
              output_dim = self.output_mlp.out_features
              # Adjust n_agents based on input if possible, fallback to init value
-             current_n_agents = n_agents if n_agents > 0 else self.n_agents
-             return torch.zeros(batch_size, current_n_agents, output_dim, device=self.device)
+             return torch.zeros(batch_size, n_agents, output_dim, device=self.device)
 
         # Build the graph structure for the batch
         x, edge_index, _ = self._build_graph_batch(obs) # We don't strictly need the batch_vector for GCNConv
@@ -187,7 +184,7 @@ class GNNActor(nn.Module):
         agent_outputs = self.output_mlp(x) # Shape: (batch_size * n_agents, n_agent_outputs)
 
         # Reshape back to (batch_size, n_agents, n_agent_outputs)
-        final_output = agent_outputs.view(batch_size, self.n_agents, -1)
+        final_output = agent_outputs.view(batch_size, n_agents, -1)
 
         # Return the tensor; TensorDictModule will handle putting it into the output key
         return final_output

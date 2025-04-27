@@ -26,6 +26,7 @@ from torchrl.objectives import ClipPPOLoss, ValueEstimators
 from utils.logging import init_logging, log_evaluation, log_training
 from utils.utils import DoneTransform
 from models.gnn_actor import GNNActor
+from models.gnn_critic import GNNCritic
 
 
 def rendering_callback(env, td):
@@ -83,7 +84,6 @@ def train(cfg: "DictConfig"):  # noqa: F821
         GNNActor(
             n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
             n_agent_outputs=2 * env.action_spec.shape[-1],
-            n_agents=env.n_agents,
             gnn_hidden_dim=gnn_hidden_dim,
             n_gnn_layers=gnn_layers,
             activation_class=nn.Tanh,
@@ -113,20 +113,31 @@ def train(cfg: "DictConfig"):  # noqa: F821
     )
 
     # Critic
-    module = MultiAgentMLP(
+    # module = MultiAgentMLP(
+    #     n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
+    #     n_agent_outputs=1,
+    #     n_agents=env.n_agents,
+    #     centralised=cfg.model.centralised_critic,
+    #     share_params=cfg.model.shared_parameters,
+    #     device=cfg.train.device,
+    #     depth=2,
+    #     num_cells=256,
+    #     activation_class=nn.Tanh,
+    # )
+    critic_module = GNNCritic(
         n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
-        n_agent_outputs=1,
-        n_agents=env.n_agents,
-        centralised=cfg.model.centralised_critic,
-        share_params=cfg.model.shared_parameters,
-        device=cfg.train.device,
-        depth=2,
-        num_cells=256,
+        gnn_hidden_dim=gnn_hidden_dim, # Use same GNN params as actor (can be configured separately if needed)
+        gnn_layers=gnn_layers,
         activation_class=nn.Tanh,
+        k_neighbours=k_neighbours,
+        pos_indices=pos_indices,
+        share_params=cfg.model.shared_parameters, # Kept for consistency, GNN shares anyway
+        device=device, # Pass device object
     )
     value_module = ValueOperator(
-        module=module,
+        module=critic_module,
         in_keys=[("agents", "observation")],
+        out_keys=[("agents", "")]
     )
 
     collector = SyncDataCollector(
