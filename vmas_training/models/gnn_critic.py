@@ -100,6 +100,8 @@ class GNNCritic(nn.Module):
                 - edge_index (torch.Tensor): Edge indices, shape (2, num_total_edges)
                 - batch_vector (torch.Tensor): Maps each node to its batch index, shape (batch_size * n_agents)
         """
+        print(f"GOT OBS WITH SHAPE {obs.shape}")
+        print(f"GOT OBS WITH  {obs[0]}")
         batch_size, n_agents, obs_dim = obs.shape
         if n_agents == 0: # Handle case with no agents
              return (torch.empty(0, obs_dim, device=self.device),
