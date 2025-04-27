@@ -86,87 +86,72 @@ class GNNCritic(nn.Module):
         self.output_mlp = nn.Linear(gnn_hidden_dim, 1)
         self.activation = activation_class()
 
+
     def _build_graph_batch(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Builds PyG batch graph data from batched observations.
-        Identical to the actor's implementation.
-
-        Args:
-            obs (torch.Tensor): Observation tensor of shape (batch_size, n_agents, obs_dim)
-
-        Returns:
-            tuple(torch.Tensor, torch.Tensor, torch.Tensor):
-                - x (torch.Tensor): Node features, shape (batch_size * n_agents, obs_dim)
-                - edge_index (torch.Tensor): Edge indices, shape (2, num_total_edges)
-                - batch_vector (torch.Tensor): Maps each node to its batch index, shape (batch_size * n_agents)
+        Expects obs shape: (batch_size * time_or_other_dims, n_agents, obs_dim)
         """
-        print(f"GOT OBS WITH SHAPE {obs.shape}")
-        print(f"GOT OBS WITH  {obs[0]}")
-        batch_size, n_agents, obs_dim = obs.shape
+        # This method now expects a 3D tensor after potential reshaping in forward()
+        batch_size_eff, n_agents, obs_dim = obs.shape # effective batch_size might be batch*time
+
         if n_agents == 0: # Handle case with no agents
-             return (torch.empty(0, obs_dim, device=self.device),
-                     torch.empty(2, 0, dtype=torch.long, device=self.device),
-                     torch.empty(0, dtype=torch.long, device=self.device))
+            return (torch.empty(0, obs_dim, device=self.device),
+                    torch.empty(2, 0, dtype=torch.long, device=self.device),
+                    torch.empty(0, dtype=torch.long, device=self.device))
 
         # Node features (flatten batch and agent dims)
-        x = obs.reshape(batch_size * n_agents, obs_dim)
+        x = obs.reshape(batch_size_eff * n_agents, obs_dim)
 
         # Extract positions for distance calculation
-        pos = obs[:, :, self.pos_indices].to(self.device) # (batch_size, n_agents, 2 or 3)
+        pos = obs[:, :, self.pos_indices].to(self.device) # (batch_size_eff, n_agents, 2 or 3)
 
         # --- Efficient Batched Graph Construction ---
-        # Create indices for nodes within each batch element
         node_indices = torch.arange(n_agents, device=self.device)
-        # Use meshgrid to get all pairs of nodes (row, col) within each agent group
         col, row = torch.meshgrid(node_indices, node_indices, indexing='ij')
-        col = col.reshape(1, n_agents, n_agents) # Add batch dim for broadcasting
+        col = col.reshape(1, n_agents, n_agents)
         row = row.reshape(1, n_agents, n_agents)
-
-        # Calculate pairwise distances within each batch element
-        # Shape: (batch_size, n_agents, n_agents)
         dist = torch.cdist(pos, pos, p=2)
 
-        if self.k_neighbours is None or self.k_neighbours >= n_agents:
-            # Fully connected graph within each batch element (excluding self-loops initially)
-            adj = torch.ones(batch_size, n_agents, n_agents, dtype=torch.bool, device=self.device)
-            adj.diagonal(dim1=-2, dim2=-1).fill_(False) # Remove self-loops for edge_index construction
-            edge_index_list = [adj[b].nonzero().t() + b * n_agents for b in range(batch_size)]
-            edge_index = torch.cat(edge_index_list, dim=1)
-        elif self.k_neighbours > 0:
-             # K-Nearest Neighbors graph construction
-             knn_val, knn_idx = torch.topk(dist, k=self.k_neighbours + 1, dim=-1, largest=False, sorted=True)
-             # knn_idx shape: (batch_size, n_agents, self.k + 1)
+        if self.k_neighbours is None or self.k_neighbours <= 0 or self.k_neighbours >= n_agents:
+            # Fully connected or no edges (handle k=0 explicitly)
+            if self.k_neighbours is not None and self.k_neighbours <= 0:
+                edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
+            else: # Fully connected
+                adj = torch.ones(batch_size_eff, n_agents, n_agents, dtype=torch.bool, device=self.device)
+                adj.diagonal(dim1=-2, dim2=-1).fill_(False)
+                edge_index_list = [adj[b].nonzero().t() + b * n_agents for b in range(batch_size_eff)]
+                if not edge_index_list: # Handle empty list if batch_size_eff is 0
+                    edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
+                else:
+                    edge_index = torch.cat(edge_index_list, dim=1)
 
-             # Exclude self-loops which should be the closest (index 0)
-             neighbor_idx = knn_idx[..., 1:] # Shape: (batch_size, n_agents, self.k)
-             source_idx = torch.arange(n_agents, device=self.device).view(1, -1, 1).expand(batch_size, -1, self.k_neighbours)
+        else: # K-Nearest Neighbors graph construction
+             knn_val, knn_idx = torch.topk(dist, k=int(self.k_neighbours + 1), dim=-1, largest=False, sorted=True)
+             neighbor_idx = knn_idx[..., 1:]
+             source_idx = torch.arange(n_agents, device=self.device).view(1, -1, 1).expand(batch_size_eff, -1, int(self.k_neighbours))
 
-             # --- Construct edge_index for the batch ---
-             # Flatten the source and target indices
-             flat_source = source_idx.reshape(batch_size, -1) # (batch_size, n_agents * k)
-             flat_target = neighbor_idx.reshape(batch_size, -1) # (batch_size, n_agents * k)
+             flat_source = source_idx.reshape(batch_size_eff, -1)
+             flat_target = neighbor_idx.reshape(batch_size_eff, -1)
 
-             # Add offsets for batching
              row_list = []
              col_list = []
              node_offset = 0
-             for b in range(batch_size):
+             for b in range(batch_size_eff):
                  rows_b = flat_source[b] + node_offset
                  cols_b = flat_target[b] + node_offset
                  row_list.append(rows_b)
                  col_list.append(cols_b)
                  node_offset += n_agents
 
-             row_edge = torch.cat(row_list) # Source nodes
-             col_edge = torch.cat(col_list) # Target nodes
-             edge_index = torch.stack([row_edge, col_edge], dim=0) # Shape (2, batch_size * n_agents * k)
-        else: # k_neighbours == 0, no edges
-            edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
+             if not row_list: # Handle empty list if batch_size_eff is 0
+                 edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
+             else:
+                 row_edge = torch.cat(row_list)
+                 col_edge = torch.cat(col_list)
+                 edge_index = torch.stack([row_edge, col_edge], dim=0)
 
-
-        # Create the batch vector (needed by some PyG layers/utilities, though not GCNConv directly)
-        batch_vector = torch.arange(batch_size, device=self.device).repeat_interleave(n_agents)
-
+        batch_vector = torch.arange(batch_size_eff, device=self.device).repeat_interleave(n_agents)
         return x, edge_index, batch_vector
 
 
@@ -183,6 +168,61 @@ class GNNCritic(nn.Module):
         """
         # Ensure input is on the correct device and dtype
         obs = agent_observations.to(device=self.device, dtype=torch.float32)
+        original_shape = obs.shape
+        n_dims = obs.dim()
+
+        # --- Reshape input if necessary ---
+        if n_dims == 4:
+            # Input is likely (batch, time, n_agents, obs_dim)
+            batch_size, time_steps, n_agents, obs_dim = original_shape
+            # Merge batch and time dimensions
+            obs_reshaped = obs.reshape(batch_size * time_steps, n_agents, obs_dim)
+        elif n_dims == 3:
+            # Input is likely (batch, n_agents, obs_dim)
+            batch_size, n_agents, obs_dim = original_shape
+            obs_reshaped = obs # No reshape needed, but use consistent variable name
+        else:
+            raise ValueError(f"GNNCritic received input with unexpected number of dimensions: {n_dims}. Expected 3 or 4.")
+
+        # --- Handle Empty Input After Reshape ---
+        current_batch_size = obs_reshaped.shape[0]
+        current_n_agents = obs_reshaped.shape[1]
+
+        if current_batch_size == 0 or current_n_agents == 0:
+            output_dim = self.output_mlp.out_features # Should be 1
+            # Determine the correct output shape based on the original input shape
+            if n_dims == 4:
+                 final_shape = (*original_shape[:-1], output_dim) # (batch, time, n_agents, 1)
+            else: # n_dims == 3
+                 final_shape = (*original_shape[:-1], output_dim) # (batch, n_agents, 1)
+            return torch.zeros(final_shape, device=self.device, dtype=torch.float32)
+
+
+        # --- Process the (now 3D) reshaped observations ---
+        # Build the graph structure for the potentially merged batch
+        # Pass current_n_agents to _build_graph_batch if it relies on it
+        x, edge_index, _ = self._build_graph_batch(obs_reshaped)
+
+        # Pass through GNN layers
+        for layer in self.gnn_layers:
+            x = layer(x, edge_index)
+            x = self.activation(x)
+
+        # Pass through final MLP head to get value estimates
+        # Output shape: (current_batch_size * current_n_agents, 1)
+        agent_values = self.output_mlp(x)
+
+        # --- Reshape output back to original dimensionality ---
+        # Reshape based on the original input dimensions
+        if n_dims == 4:
+            # Reshape back to (batch_size, time_steps, n_agents, 1)
+            final_output = agent_values.view(batch_size, time_steps, n_agents, 1)
+        else: # n_dims == 3
+            # Reshape back to (batch_size, n_agents, 1)
+            final_output = agent_values.view(batch_size, n_agents, 1)
+
+        return final_output
+
 
         # obs shape: (batch_size, n_agents, obs_dim)
         batch_size = obs.shape[0]
