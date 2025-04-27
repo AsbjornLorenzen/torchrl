@@ -39,7 +39,7 @@ class GNNCritic(nn.Module):
         self,
         n_agent_inputs: int,
         gnn_hidden_dim: int = 128,
-        n_gnn_layers: int = 2,
+        gnn_layers: int = 2,
         activation_class=nn.Tanh,
         k_neighbours: float | None = None,
         pos_indices: slice = slice(0, 2), # Indices for XY position in observation
@@ -76,7 +76,7 @@ class GNNCritic(nn.Module):
         # Define GNN layers
         self.gnn_layers = nn.ModuleList()
         input_dim = n_agent_inputs
-        for _ in range(n_gnn_layers):
+        for _ in range(gnn_layers):
             # Using GCNConv as an example, same as actor
             self.gnn_layers.append(GCNConv(input_dim, gnn_hidden_dim))
             input_dim = gnn_hidden_dim

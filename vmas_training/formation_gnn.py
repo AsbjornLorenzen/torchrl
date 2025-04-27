@@ -132,7 +132,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         k_neighbours=k_neighbours,
         pos_indices=pos_indices,
         share_params=cfg.model.shared_parameters, # Kept for consistency, GNN shares anyway
-        device=device, # Pass device object
+        device=cfg.train.device, # Pass device object
     )
     value_module = ValueOperator(
         module=critic_module,
