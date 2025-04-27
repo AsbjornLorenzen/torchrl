@@ -137,7 +137,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     value_module = ValueOperator(
         module=critic_module,
         in_keys=[("agents", "observation")],
-        out_keys=[("agents", "")]
+        out_keys=[("agents", "state_value")]
     )
 
     collector = SyncDataCollector(
@@ -169,6 +169,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         action=env.action_key,
         done=("agents", "done"),
         terminated=("agents", "terminated"),
+        value=("agents", "state_value")
     )
     loss_module.make_value_estimator(
         ValueEstimators.GAE, gamma=cfg.loss.gamma, lmbda=cfg.loss.lmbda
