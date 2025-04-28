@@ -113,7 +113,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     )
 
     # Critic
-    # module = MultiAgentMLP(
+    # critic_module = MultiAgentMLP(
     #     n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
     #     n_agent_outputs=1,
     #     n_agents=env.n_agents,
@@ -129,7 +129,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         gnn_hidden_dim=gnn_hidden_dim, # Use same GNN params as actor (can be configured separately if needed)
         gnn_layers=gnn_layers,
         activation_class=nn.Tanh,
-        k_neighbours=k_neighbours,
+        k_neighbours=None,
         pos_indices=pos_indices,
         share_params=cfg.model.shared_parameters, # Kept for consistency, GNN shares anyway
         device=cfg.train.device, # Pass device object

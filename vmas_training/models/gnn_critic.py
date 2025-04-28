@@ -8,11 +8,13 @@ import torch
 from torch import nn
 from tensordict import TensorDict
 
+
 # --- PyG Imports ---
 try:
     import torch_geometric
     from torch_geometric.nn import GCNConv # Example GNN layer
     from torch_geometric.data import Data, Batch
+    from torch_geometric.utils import add_self_loops as pyg_add_self_loops
     _has_pyg = True
 except ImportError:
     _has_pyg = False
@@ -67,92 +69,108 @@ class GNNCritic(nn.Module):
         super().__init__()
         if not _has_pyg:
             raise ImportError("PyTorch Geometric is required for GNNCritic.")
-
         self.n_agent_inputs = n_agent_inputs
         self.k_neighbours = k_neighbours
         self.pos_indices = pos_indices
-        self.device = device # Store device
+        self.device = device
 
         # Define GNN layers
         self.gnn_layers = nn.ModuleList()
         input_dim = n_agent_inputs
-        for _ in range(gnn_layers):
-            # Using GCNConv as an example, same as actor
-            self.gnn_layers.append(GCNConv(input_dim, gnn_hidden_dim))
+        for i in range(gnn_layers):
+            # Initialize GCNConv with BOTH add_self_loops=False AND normalize=False
+            self.gnn_layers.append(
+                GCNConv(
+                    input_dim,
+                    gnn_hidden_dim,
+                    add_self_loops=False, # Set to False
+                    normalize=False      # Must be False
+                )
+            )
             input_dim = gnn_hidden_dim
 
         # Output MLP head for each agent's value estimate
-        # Output dimension is 1 for the value function
         self.output_mlp = nn.Linear(gnn_hidden_dim, 1)
         self.activation = activation_class()
-
 
     def _build_graph_batch(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Builds PyG batch graph data from batched observations.
+        Adds self-loops manually to the edge_index.
         Expects obs shape: (batch_size * time_or_other_dims, n_agents, obs_dim)
         """
-        # This method now expects a 3D tensor after potential reshaping in forward()
-        batch_size_eff, n_agents, obs_dim = obs.shape # effective batch_size might be batch*time
+        batch_size_eff, n_agents, obs_dim = obs.shape
+        num_nodes = batch_size_eff * n_agents # Total number of nodes in the batch
 
-        if n_agents == 0: # Handle case with no agents
-            return (torch.empty(0, obs_dim, device=self.device),
-                    torch.empty(2, 0, dtype=torch.long, device=self.device),
-                    torch.empty(0, dtype=torch.long, device=self.device))
+        if n_agents == 0:
+             return (torch.empty(0, obs_dim, device=self.device),
+                     torch.empty(2, 0, dtype=torch.long, device=self.device),
+                     torch.empty(0, dtype=torch.long, device=self.device))
 
-        # Node features (flatten batch and agent dims)
-        x = obs.reshape(batch_size_eff * n_agents, obs_dim)
+        x = obs.reshape(num_nodes, obs_dim)
+        pos = obs[:, :, self.pos_indices].to(self.device)
 
-        # Extract positions for distance calculation
-        pos = obs[:, :, self.pos_indices].to(self.device) # (batch_size_eff, n_agents, 2 or 3)
-
-        # --- Efficient Batched Graph Construction ---
         node_indices = torch.arange(n_agents, device=self.device)
-        col, row = torch.meshgrid(node_indices, node_indices, indexing='ij')
-        col = col.reshape(1, n_agents, n_agents)
-        row = row.reshape(1, n_agents, n_agents)
         dist = torch.cdist(pos, pos, p=2)
 
+        # --- Graph Construction Logic ---
         if self.k_neighbours is None or self.k_neighbours <= 0 or self.k_neighbours >= n_agents:
-            # Fully connected or no edges (handle k=0 explicitly)
             if self.k_neighbours is not None and self.k_neighbours <= 0:
-                edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
+                 edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
             else: # Fully connected
                 adj = torch.ones(batch_size_eff, n_agents, n_agents, dtype=torch.bool, device=self.device)
-                adj.diagonal(dim1=-2, dim2=-1).fill_(False)
+                adj.diagonal(dim1=-2, dim2=-1).fill_(False) # Start without self-loops
                 edge_index_list = [adj[b].nonzero().t() + b * n_agents for b in range(batch_size_eff)]
-                if not edge_index_list: # Handle empty list if batch_size_eff is 0
+                if not edge_index_list:
                     edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
                 else:
                     edge_index = torch.cat(edge_index_list, dim=1)
+        else: # K-Nearest Neighbors
+             k_int = int(self.k_neighbours)
+             # Request k neighbors (don't need +1 anymore as we don't rely on GCNConv adding loops)
+             knn_val, knn_idx = torch.topk(dist, k=k_int, dim=-1, largest=False, sorted=True)
 
-        else: # K-Nearest Neighbors graph construction
-             knn_val, knn_idx = torch.topk(dist, k=int(self.k_neighbours + 1), dim=-1, largest=False, sorted=True)
-             neighbor_idx = knn_idx[..., 1:]
-             source_idx = torch.arange(n_agents, device=self.device).view(1, -1, 1).expand(batch_size_eff, -1, int(self.k_neighbours))
+             # Filter out self-references if k is large enough to include them
+             # Note: This simple knn_idx might contain self-references if k is large.
+             # A more robust KNN would compute distances and explicitly exclude self before topk.
+             # However, add_self_loops later handles duplicates correctly.
+
+             source_idx = torch.arange(n_agents, device=self.device).view(1, -1, 1).expand(batch_size_eff, -1, k_int)
 
              flat_source = source_idx.reshape(batch_size_eff, -1)
-             flat_target = neighbor_idx.reshape(batch_size_eff, -1)
+             flat_target = knn_idx.reshape(batch_size_eff, -1) # Use knn_idx directly
 
              row_list = []
              col_list = []
              node_offset = 0
              for b in range(batch_size_eff):
-                 rows_b = flat_source[b] + node_offset
-                 cols_b = flat_target[b] + node_offset
+                 # Filter out self-loops from KNN results before adding offset
+                 b_source = flat_source[b]
+                 b_target = flat_target[b]
+                 non_self_loop_mask = (b_source != b_target)
+                 rows_b = b_source[non_self_loop_mask] + node_offset
+                 cols_b = b_target[non_self_loop_mask] + node_offset
+
                  row_list.append(rows_b)
                  col_list.append(cols_b)
                  node_offset += n_agents
 
-             if not row_list: # Handle empty list if batch_size_eff is 0
+             if not row_list:
                  edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
              else:
                  row_edge = torch.cat(row_list)
                  col_edge = torch.cat(col_list)
                  edge_index = torch.stack([row_edge, col_edge], dim=0)
 
+        # --- Manually Add Self-Loops ---
+        # pyg_add_self_loops returns edge_index and edge_weights (optional)
+        # We only need the updated edge_index. It handles duplicates.
+        edge_index_with_loops, _ = pyg_add_self_loops(edge_index, num_nodes=num_nodes)
+
         batch_vector = torch.arange(batch_size_eff, device=self.device).repeat_interleave(n_agents)
-        return x, edge_index, batch_vector
+
+        # Return the edge_index *with* manually added self-loops
+        return x, edge_index_with_loops, batch_vector
 
 
     def forward(self, agent_observations: torch.Tensor) -> torch.Tensor:
