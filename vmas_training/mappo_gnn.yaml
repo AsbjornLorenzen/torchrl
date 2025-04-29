@@ -33,8 +33,8 @@ loss:
 
 train:
   num_epochs: 45  # optimization steps per batch of data collected
-  minibatch_size: 64 # size of minibatches used in each epoch
-  lr: 1e-6
+  minibatch_size: 20 # size of minibatches used in each epoch
+  lr: 5e-6
   max_grad_norm: 40.0
   device: ???
 
