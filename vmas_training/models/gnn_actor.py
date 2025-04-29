@@ -100,7 +100,6 @@ class GNNActor(nn.Module):
                 - edge_index (torch.Tensor): Edge indices, shape (2, num_total_edges)
                 - batch_vector (torch.Tensor): Maps each node to its batch index, shape (batch_size * n_agents)
         """
-        print(f"ACTOR HAS OBS {obs.shape}")
         batch_size, n_agents, obs_dim = obs.shape
         if n_agents == 0: # Handle case with no agents
              return (torch.empty(0, obs_dim, device=self.device),
