@@ -87,88 +87,96 @@ class GNNActor(nn.Module):
         self.output_mlp = nn.Linear(gnn_hidden_dim, n_agent_outputs)
         self.activation = activation_class()
 
-
     def _build_graph_batch(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Builds PyG batch graph data from batched observations.
+        """
+        Builds PyG batch graph data from batched observations, including self-loops.
 
-        Args:
-            obs (torch.Tensor): Observation tensor of shape (batch_size, n_agents, obs_dim)
+        Args:
+            obs (torch.Tensor): Observation tensor of shape (batch_size, n_agents, obs_dim)
 
-        Returns:
-            tuple(torch.Tensor, torch.Tensor, torch.Tensor):
-                - x (torch.Tensor): Node features, shape (batch_size * n_agents, obs_dim)
-                - edge_index (torch.Tensor): Edge indices, shape (2, num_total_edges)
-                - batch_vector (torch.Tensor): Maps each node to its batch index, shape (batch_size * n_agents)
-        """
-        batch_size, n_agents, obs_dim = obs.shape
-        if n_agents == 0: # Handle case with no agents
-             return (torch.empty(0, obs_dim, device=self.device),
-                    torch.empty(2, 0, dtype=torch.long, device=self.device),
-                    torch.empty(0, dtype=torch.long, device=self.device))
+        Returns:
+            tuple(torch.Tensor, torch.Tensor, torch.Tensor):
+                - x (torch.Tensor): Node features, shape (batch_size * n_agents, obs_dim)
+                - edge_index (torch.Tensor): Edge indices, shape (2, num_total_edges)
+                - batch_vector (torch.Tensor): Maps each node to its batch index, shape (batch_size * n_agents)
+        """
+        batch_size, n_agents, obs_dim = obs.shape
+        if n_agents == 0: # Handle case with no agents
+            return (torch.empty(0, obs_dim, device=self.device),
+                    torch.empty(2, 0, dtype=torch.long, device=self.device),
+                    torch.empty(0, dtype=torch.long, device=self.device))
 
-        # Node features (flatten batch and agent dims)
-        x = obs.reshape(batch_size * n_agents, obs_dim)
+        # Node features (flatten batch and agent dims)
+        x = obs.reshape(batch_size * n_agents, obs_dim)
 
-        # Extract positions for distance calculation
-        # Ensure positions are on the correct device
-        pos = obs[:, :, self.pos_indices].to(self.device) # (batch_size, n_agents, 2 or 3)
+        # Extract positions for distance calculation
+        # Ensure positions are on the correct device
+        pos = obs[:, :, self.pos_indices].to(self.device) # (batch_size, n_agents, 2 or 3)
 
-        # --- Efficient Batched Graph Construction ---
+        # --- Efficient Batched Graph Construction ---
 
-        # Calculate pairwise distances within each batch element
-        # Shape: (batch_size, n_agents, n_agents)
-        dist = torch.cdist(pos, pos, p=2)
+        # Calculate pairwise distances within each batch element
+        # Shape: (batch_size, n_agents, n_agents)
+        dist = torch.cdist(pos, pos, p=2)
 
-        # Find k-nearest neighbors (including self for now)
-        # knn_idx shape: (batch_size, n_agents, self.k + 1)
-        knn_val, knn_idx = torch.topk(dist, k=self.k_neighbours + 1, dim=-1, largest=False, sorted=True)
+        # Find k-nearest neighbors (including self for now)
+        # knn_idx shape: (batch_size, n_agents, self.k + 1)
+        # Only calculate if k_neighbours > 0, otherwise knn_edge_index will be empty
+        if self.k_neighbours is not None and self.k_neighbours > 0:
+            knn_val, knn_idx = torch.topk(dist, k=self.k_neighbours + 1, dim=-1, largest=False, sorted=True)
 
-        # Get indices of the k-NN (excluding self - this creates the non-self-loop edges)
-        neighbor_idx = knn_idx[..., 1:] # Shape: (batch_size, n_agents, self.k)
-        source_idx = torch.arange(n_agents, device=self.device).view(1, -1, 1).expand(batch_size, -1, self.k_neighbours)
+            # Get indices of the k-NN (excluding self - this creates the non-self-loop edges)
+            neighbor_idx = knn_idx[..., 1:] # Shape: (batch_size, n_agents, self.k)
+            source_idx = torch.arange(n_agents, device=self.device).view(1, -1, 1).expand(batch_size, -1, self.k_neighbours)
 
-        # Flatten the source and target indices for k-NN edges
-        flat_source_knn = source_idx.reshape(batch_size, -1) # (batch_size, n_agents * k)
-        flat_target_knn = neighbor_idx.reshape(batch_size, -1) # (batch_size, n_agents * k)
+            # Flatten the source and target indices for k-NN edges
+            flat_source_knn = source_idx.reshape(batch_size, -1) # (batch_size, n_agents * k)
+            flat_target_knn = neighbor_idx.reshape(batch_size, -1) # (batch_size, n_agents * k)
 
-        # --- Construct k-NN edge_index for the batch ---
-        # Add offsets for batching
-        row_list_knn = []
-        col_list_knn = []
-        batch_vector_list = [] # Only need to build this once
-        node_offset = 0
-        for b in range(batch_size):
-            # k-NN edges
-            rows_b_knn = flat_source_knn[b] + node_offset
-            cols_b_knn = flat_target_knn[b] + node_offset
-            row_list_knn.append(rows_b_knn)
-            col_list_knn.append(cols_b_knn)
+            # --- Construct k-NN edge_index for the batch ---
+            # Add offsets for batching
+            row_list_knn = []
+            col_list_knn = []
+            node_offset = 0
+            for b in range(batch_size):
+                # k-NN edges
+                rows_b_knn = flat_source_knn[b] + node_offset
+                cols_b_knn = flat_target_knn[b] + node_offset
+                row_list_knn.append(rows_b_knn)
+                col_list_knn.append(cols_b_knn)
+                node_offset += n_agents
 
-            # Batch vector (same for all nodes in the batch)
-            batch_vector_list.append(torch.full((n_agents,), b, dtype=torch.long, device=self.device))
+            row_edge_knn = torch.cat(row_list_knn) # Source nodes for k-NN
+            col_edge_knn = torch.cat(col_list_knn) # Target nodes for k-NN
 
-            node_offset += n_agents
+            knn_edge_index = torch.stack([row_edge_knn, col_edge_knn], dim=0) # Shape (2, batch_size * n_agents * k)
+        else:
+             # If k_neighbours is 0 or None, there are no k-NN edges
+             knn_edge_index = torch.empty(2, 0, dtype=torch.long, device=self.device)
+             node_offset = batch_size * n_agents # Need node_offset for batch_vector construction below
 
-        row_edge_knn = torch.cat(row_list_knn) # Source nodes for k-NN
-        col_edge_knn = torch.cat(col_list_knn) # Target nodes for k-NN
 
-        knn_edge_index = torch.stack([row_edge_knn, col_edge_knn], dim=0) # Shape (2, batch_size * n_agents * k)
+        # --- Construct Self-Loop edge_index for the batch ---
+        # Global node indices for all nodes
+        global_node_indices = torch.arange(batch_size * n_agents, device=self.device)
+        # Self-loop edges: each node connects to itself
+        self_loop_edge_index = torch.stack([global_node_indices, global_node_indices], dim=0) # Shape (2, batch_size * n_agents)
 
+        # --- Combine k-NN edges and Self-Loop edges ---
+        edge_index = torch.cat([knn_edge_index, self_loop_edge_index], dim=1) # Concatenate along the edge dimension
 
-        # --- Construct Self-Loop edge_index for the batch ---
-        # Global node indices for all nodes
-        global_node_indices = torch.arange(batch_size * n_agents, device=self.device)
-        # Self-loop edges: each node connects to itself
-        self_loop_edge_index = torch.stack([global_node_indices, global_node_indices], dim=0) # Shape (2, batch_size * n_agents)
+        # --- Construct Batch Vector ---
+        # This needs to be built regardless of k_neighbours value
+        batch_vector_list = []
+        node_offset_batch_vector = 0 # Use a separate offset for batch_vector construction
+        for b in range(batch_size):
+             batch_vector_list.append(torch.full((n_agents,), b, dtype=torch.long, device=self.device))
+             node_offset_batch_vector += n_agents # This offset should reach batch_size * n_agents
 
-        # --- Combine k-NN edges and Self-Loop edges ---
-        edge_index = torch.cat([knn_edge_index, self_loop_edge_index], dim=1) # Concatenate along the edge dimension
+        # Batch vector (maps flattened nodes back to original batch index)
+        batch_vector = torch.cat(batch_vector_list) # Shape (batch_size * n_agents)
 
-        # Batch vector (maps flattened nodes back to original batch index)
-        batch_vector = torch.cat(batch_vector_list) # Shape (batch_size * n_agents)
-
-        return x, edge_index, batch_vector
+        return x, edge_index, batch_vector
 
 
     def forward(self, agent_observations: torch.Tensor) -> torch.Tensor:
