@@ -18,7 +18,7 @@ model:
 
 
 collector:
-  frames_per_batch: 60_000 # Frames sampled each sampling iteration
+  frames_per_batch: 6_000 # Frames sampled each sampling iteration
   n_iters: 500 # Number of sampling/training iterations
   total_frames: ???
 
@@ -33,8 +33,8 @@ loss:
 
 train:
   num_epochs: 45  # optimization steps per batch of data collected
-  minibatch_size: 4096 # size of minibatches used in each epoch
-  lr: 1e-6
+  minibatch_size: 20 # size of minibatches used in each epoch
+  lr: 5e-6
   max_grad_norm: 40.0
   device: ???
 
