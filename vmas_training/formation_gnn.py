@@ -140,11 +140,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         out_keys=[("agents", "state_value")]
     )
 
-<<<<<<< HEAD
-    device = torch.device(cfg.train.device) # Get the torch.device object
-=======
     device = torch.device(cfg.train.device)
->>>>>>> a63dc3a41bcb9aa9645c2584fbb9bae9a4fc187d
     policy.to(device)
     value_module.to(device)
 
