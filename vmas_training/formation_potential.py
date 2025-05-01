@@ -72,6 +72,8 @@ def train(cfg: "DictConfig"):  # noqa: F821
         **cfg.env.scenario,
     )
 
+    breakpoint()
+
     # Policy
     actor_net = nn.Sequential(
         MultiAgentMLP(
@@ -92,6 +94,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         in_keys=[("agents", "observation")],
         out_keys=[("agents", "loc"), ("agents", "scale")],
     )
+
     policy = ProbabilisticActor(
         module=policy_module,
         spec=env.full_action_spec_unbatched,
@@ -104,6 +107,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         },
         return_log_prob=True,
     )
+    breakpoint()
 
     # Critic
     module = MultiAgentMLP(
