@@ -72,8 +72,8 @@ def train(cfg: "DictConfig"):  # noqa: F821
         **cfg.env.scenario,
     )
 
-    breakpoint()
 
+    print(f"In torchrl, the given env action spec is {env.action_spec}")
     # Policy
     actor_net = nn.Sequential(
         MultiAgentMLP(
@@ -95,6 +95,8 @@ def train(cfg: "DictConfig"):  # noqa: F821
         out_keys=[("agents", "loc"), ("agents", "scale")],
     )
 
+    lowest_action = torch.zeros_like(env.full_action_spec_unbatched[("agents", "action")].space.low, device=cfg.train.device)
+
     policy = ProbabilisticActor(
         module=policy_module,
         spec=env.full_action_spec_unbatched,
@@ -102,12 +104,11 @@ def train(cfg: "DictConfig"):  # noqa: F821
         out_keys=[env.action_key],
         distribution_class=TanhNormal,
         distribution_kwargs={
-            "low": env.full_action_spec_unbatched[("agents", "action")].space.low,
+            "low": lowest_action,
             "high": env.full_action_spec_unbatched[("agents", "action")].space.high,
         },
         return_log_prob=True,
     )
-    breakpoint()
 
     # Critic
     module = MultiAgentMLP(

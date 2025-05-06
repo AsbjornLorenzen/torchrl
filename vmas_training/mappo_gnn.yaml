@@ -4,7 +4,7 @@ env:
   max_steps: 200
   scenario_name: "pursuit_formation_v2"
   scenario:
-    n_agents: 4
+    n_agents: 8
   device: ??? # These values will be populated dynamically
   vmas_envs: ???
 
