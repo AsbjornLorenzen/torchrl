@@ -1,10 +1,10 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
+import torch
+from torchrl.envs import Transform, TransformedEnv
+from tensordict import TensorDictBase, TensorDict
 from __future__ import annotations
 
 import time
+import random # Import random
 
 import hydra
 import torch
@@ -15,61 +15,225 @@ from torch import nn
 from torchrl._utils import logger as torchrl_logger
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import TensorDictReplayBuffer
-from torchrl.data.tensor_specs import DiscreteTensorSpec
-from torchrl.data.tensor_specs import (
-    UnboundedContinuousTensorSpec,
-    BoundedContinuous,
-    CompositeSpec,
-    Categorical,
-    Composite# For type checking if needed
-)
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.envs import RewardSum, TransformedEnv, EnvBase
+from torchrl.envs import RewardSum, TransformedEnv, Compose # Import Compose
 from torchrl.envs.libs.vmas import VmasEnv
-from torchrl.envs.utils import ExplorationType, set_exploration_type, MarlGroupMapType
+from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
-from torchrl.modules.models.multiagent import MultiAgentMLP
+# from torchrl.modules.models.multiagent import MultiAgentMLP # Not used
 from torchrl.objectives import ClipPPOLoss, ValueEstimators
-from utils.logging import init_logging, log_evaluation, log_training
-from utils.utils import DoneTransform
-from models.gnn_actor import GNNActor
-from models.gnn_critic import GNNCritic
-import random
-import torch
-from tensordict import TensorDict
+from utils.logging import init_logging, log_evaluation, log_training # Assuming these are your custom utils
+from utils.utils import DoneTransform # Assuming this is your custom util
+from models.gnn_actor import GNNActor # Assuming these are your custom models
+from models.gnn_critic import GNNCritic # Assuming these are your custom models
 
 
-def rendering_callback(env, td):
-    # Ensure env.frames exists, might need initialization on env_test
-    if not hasattr(env, 'frames'):
-        env.frames = []
-    # VMAS render call might need to be adapted if `env` is the TransformedEnv
-    # Accessing the base VMAS env for rendering:
-    base_env = env
-    while hasattr(base_env, "env") and not isinstance(base_env, VmasEnv): # Unwrap
-        base_env = base_env.env
-    if isinstance(base_env, VmasEnv):
-        env.frames.append(base_env.render(mode="rgb_array", agent_index_focus=None))
-    elif hasattr(env, '_rendering_render'): # TorchRL's common render method
-         env.frames.append(env._rendering_render(mode="rgb_array", **{}))
+rom torchrl.specs import UnboundedContinuousTensorSpec, DiscreteTensorSpec, CompositeSpec, BinaryDiscreteTensorSpec
 
+class VariableAgentWrapper(Transform):
+    def __init__(
+        self,
+        in_keys: list[str],
+        out_keys: list[str],
+        min_n_agents: int,
+        max_n_agents: int,
+        max_total_agents: int, # Max agents the env is initialized with
+        is_eval: bool = False,
+        eval_n_agents: int | None = None,
+    ):
+        if not out_keys: # By default, modify in_keys if out_keys is not provided
+            out_keys = in_keys
+        super().__init__(in_keys=in_keys, out_keys=out_keys) # in_keys not strictly used here but good practice
+        self.min_n_agents = min_n_agents
+        self.max_n_agents = max_n_agents
+        self.max_total_agents = max_total_agents
+        self.is_eval = is_eval
+        self.eval_n_agents = eval_n_agents if eval_n_agents is not None else max_total_agents
+
+        if self.is_eval and self.eval_n_agents > self.max_total_agents:
+            raise ValueError("eval_n_agents cannot exceed max_total_agents")
+        if not self.is_eval and self.max_n_agents > self.max_total_agents:
+            raise ValueError("max_n_agents for training cannot exceed max_total_agents")
+
+    def _reset(self, tensordict: TensorDictBase, tensordict_reset: TensorDictBase) -> TensorDictBase:
+        # tensordict_reset is the output of env.reset()
+        # We need to add/modify the active_mask here.
+        device = tensordict_reset.device
+        batch_size = tensordict_reset.batch_size
+
+        if self.is_eval:
+            current_n_active_agents_per_env = torch.full(
+                batch_size, self.eval_n_agents, device=device, dtype=torch.long
+            )
+        else:
+            current_n_active_agents_per_env = torch.randint(
+                self.min_n_agents,
+                self.max_n_agents + 1,
+                batch_size,
+                device=device,
+            )
+
+        active_mask = torch.zeros(
+            *batch_size, self.max_total_agents, device=device, dtype=torch.bool
+        )
+        # Create mask: for each batch item, set first current_n_active_agents to True
+        for i in range(batch_size[0]): # Assuming batch_size is like [N]
+            active_mask[i, : current_n_active_agents_per_env[i]] = True
+        
+        tensordict_reset.set(("agents", "active_mask"), active_mask)
+        # Store the count too, might be useful for averaging losses
+        tensordict_reset.set(("agents", "n_active"), current_n_active_agents_per_env.unsqueeze(-1))
+
+
+        # Mask initial observations for inactive agents (optional, but good practice)
+        # Assuming observation key is ("agents", "observation")
+        obs_key = ("agents", "observation")
+        if obs_key in tensordict_reset.keys(include_nested=True):
+            tensordict_reset[obs_key] = tensordict_reset[obs_key] * active_mask.unsqueeze(-1)
+        
+        return tensordict_reset
+
+    def _call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        # This is called before the policy.
+        # If policy needs the mask, it's already there from _reset or _step's next_td handling
+        # No action usually needed here unless you want to transform observations based on mask
+        # *before* they hit the policy in a special way.
+        return tensordict
+
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        # This method handles both reset and step logic based on tensordict content
+        if tensordict.get("is_init", None) is not None: # This indicates a reset call chain
+             # For resets, the actual reset is done by the environment, _reset is for post-processing
+            return self._reset(tensordict, tensordict.clone(False)) # Pass a clone for _reset to fill
+
+        # --- This is for the step logic ---
+        active_mask = tensordict.get(("agents", "active_mask"))
+        n_active = tensordict.get(("agents", "n_active"))
+
+        # 1. Mask actions for inactive agents BEFORE sending to env.step()
+        # Assuming env.action_key is ("agents", "action")
+        action_key = self.parent.action_key # Get action key from wrapped env
+        if action_key in tensordict.keys(include_nested=True) and active_mask is not None:
+             tensordict[action_key] = tensordict[action_key] * active_mask.unsqueeze(-1)
+
+        # tensordict is now modified with masked actions, ready for env.step()
+        # The actual env.step() is called by the collector or rollout utilities *after* this transform.
+        # This transform is part of the env, so its `step` method implicitly calls this `forward`
+        # and then the parent env's step.
+        # What we return here is the tensordict that goes INTO the parent env's step.
+        # The results of parent.step() will be in `next_tensordict`, handled by `self.step`
+
+        return tensordict # Return the modified tensordict
+
+    # This method is called with the data *after* the environment's step
+    @torch.no_grad()
+    def step(self, tensordict: TensorDictBase) -> TensorDictBase:
+        # Apply _call to the input tensordict (actions are masked here)
+        tensordict = self.forward(tensordict) # This will mask actions if not already
+        
+        # Get the active_mask from the *input* tensordict (current step)
+        # because this mask determines which agents were supposed to act
+        active_mask = tensordict.get(("agents", "active_mask"))
+        n_active = tensordict.get(("agents", "n_active"))
+
+        # Call the parent environment's step
+        next_tensordict = self.parent.step(tensordict)
+
+        # 2. Mask results (next_observation, reward, done) for inactive agents
+        # And ensure the mask is propagated
+        if active_mask is not None:
+            next_tensordict.set(("next", "agents", "active_mask"), active_mask.clone())
+            if n_active is not None:
+                next_tensordict.set(("next", "agents", "n_active"), n_active.clone())
+
+
+            obs_key = ("next", "agents", "observation")
+            if obs_key in next_tensordict.keys(include_nested=True):
+                next_tensordict[obs_key] = next_tensordict[obs_key] * active_mask.unsqueeze(-1)
+
+            reward_key = ("next", self.parent.reward_key[1]) # e.g. ("next", ("agents", "reward")) -> ("next", "agents", "reward")
+            if reward_key in next_tensordict.keys(include_nested=True):
+                 # Ensure reward key is correctly constructed if it's nested
+                path_to_reward = reward_key # if reward_key is already ('next', 'agents', 'reward')
+                if isinstance(self.parent.reward_key, tuple) and len(self.parent.reward_key) > 1: # e.g. ("agents", "reward")
+                    path_to_reward = ("next", *self.parent.reward_key)
+
+                current_reward = next_tensordict.get(path_to_reward)
+                next_tensordict.set(path_to_reward, current_reward * active_mask.unsqueeze(-1))
+
+
+            # Handle 'done' for inactive agents. Setting them to 'done' can simplify GAE.
+            # Assuming done_key is like ("next", "done") for global or ("next", "agents", "done") for per-agent
+            # Your DoneTransform uses env.done_keys which could be complex.
+            # Let's assume a per-agent done for simplicity here. If global, this part is harder.
+            # If using your `DoneTransform`, it might need to be mask-aware or this masking of done needs care.
+            # For ClipPPOLoss with agent-wise done:
+            agent_done_key_path = None
+            if ("agents", "done") in self.parent.done_keys: # from loss_module.set_keys
+                agent_done_key_path = ("next", "agents", "done")
+            
+            if agent_done_key_path and agent_done_key_path in next_tensordict.keys(include_nested=True):
+                agent_dones = next_tensordict.get(agent_done_key_path)
+                # Inactive agents are effectively "done" from the start of their inactivity
+                agent_dones = torch.where(active_mask.unsqueeze(-1), agent_dones, True)
+                next_tensordict.set(agent_done_key_path, agent_dones)
+            # If there's a global 'done', it should be true if ALL *active* agents are done.
+            # This logic is usually handled by the environment or a wrapper like DoneTransform.
+            # For now, we focus on masking rewards and observations.
+
+        return next_tensordict
+
+    def transform_observation_spec(self, observation_spec: CompositeSpec) -> CompositeSpec:
+        # Add the active_mask to the observation spec
+        if isinstance(observation_spec.get("agents", None), CompositeSpec):
+            mask_spec = BinaryDiscreteTensorSpec(
+                n=2, # True/False
+                shape=torch.Size([self.max_total_agents]), # Per agent
+                device=observation_spec.device,
+                dtype=torch.bool,
+            )
+            n_active_spec = DiscreteTensorSpec( # n_active can be up to max_total_agents
+                n=self.max_total_agents + 1, # number of agents from 0 to max_total_agents
+                shape=torch.Size([1]), # scalar per environment
+                device=observation_spec.device,
+                dtype=torch.long,
+            )
+            observation_spec["agents"].set("active_mask", mask_spec)
+            observation_spec["agents"].set("n_active", n_active_spec)
+
+        return observation_spec
+    
+    # You might also need to implement transform_input_spec, transform_reward_spec etc.
+    # if the mask needs to be reflected in all specs used by model/loss.
+    # For now, observation_spec is often the most critical for model input.
 
 
 @hydra.main(version_base="1.1", config_path="", config_name="mappo_pot")
 def train(cfg: "DictConfig"):  # noqa: F821
-    # --- Configuration ---
-    MIN_AGENTS_TRAIN = cfg.train.get("min_agents_train", 4) # Use hydra config or default
-    MAX_AGENTS_TRAIN = cfg.env.scenario.n_agents # This n_agents in scenario config should be MAX for training
-    EVAL_AGENTS = cfg.eval.get("eval_agents", MAX_AGENTS_TRAIN) # Eval agents from config or default to MAX
-
     # Device
-    cfg.train.device = "cpu" if not torch.cuda.is_available() else "cuda:0" # Updated cuda check
+    cfg.train.device = "cpu" if not torch.cuda.device_count() else "cuda:0"
     cfg.env.device = cfg.train.device
 
     # Seeding
     torch.manual_seed(cfg.seed)
-    random.seed(cfg.seed) # Also seed python's random for agent number selection
+
+    # --- Key Change: Initialize with MAX_AGENTS_EVAL ---
+    # Ensure your VmasEnv scenario config (cfg.env.scenario) uses cfg.env.max_agents_eval
+    # For example, if scenario is 'balance', then cfg.env.scenario.n_agents = cfg.env.max_agents_eval
+    # This needs to be set in your hydra config file.
+    # Let's assume cfg.env.scenario already has n_agents reflecting max_agents_eval
+    # or that VmasEnv takes n_agents directly if not in scenario kwargs.
+    
+    # For Vmas, `n_agents` is often a direct parameter of the scenario,
+    # so you'd typically pass it like: `scenario_kwargs={"n_agents": cfg.env.max_agents_eval, ...}`
+    # Update: VmasEnv takes n_agents directly for some scenarios if not specified in scenario_kwargs
+    # Let's add it explicitly for clarity if it's a top-level VmasEnv param for your scenario
+    # If 'n_agents' is part of cfg.env.scenario, ensure it's set to cfg.env.max_agents_eval there.
+    # For the example, let's assume `cfg.env.scenario` will have `n_agents`.
+    # A common Vmas pattern for n_agents:
+    scenario_kwargs = dict(cfg.env.scenario)
+    scenario_kwargs['n_agents'] = cfg.env.max_agents_eval # Explicitly set for clarity
 
     # Sampling
     cfg.env.vmas_envs = cfg.collector.frames_per_batch // cfg.env.max_steps
@@ -77,202 +241,147 @@ def train(cfg: "DictConfig"):  # noqa: F821
     cfg.buffer.memory_size = cfg.collector.frames_per_batch
 
 
-    # --- Create Training Environment with VariableAgentWrapper ---
-    # 1. Base VmasEnv is initialized with MAX_AGENTS_TRAIN
-    #    All its specs will be based on this maximum number.
-    base_vmas_env = VmasEnv(
+    # Create env and env_test
+    # Pass the actual max number of agents the env should simulate
+    base_env = VmasEnv(
         scenario=cfg.env.scenario_name,
         num_envs=cfg.env.vmas_envs,
         continuous_actions=True,
         max_steps=cfg.env.max_steps,
         device=cfg.env.device,
         seed=cfg.seed,
-        group_map=MarlGroupMapType.ALL_IN_ONE_GROUP,
-        **cfg.env.scenario, # Scenario kwargs might also contain n_agents, ensure consistency
+        n_agents=cfg.env.max_agents_eval, # Explicitly set n_agents for VMAS
+        # Scenario kwargs
+        **scenario_kwargs, # This might also contain n_agents, ensure consistency
     )
-
-    # 2. Wrap with VariableAgentWrapper
-    #    This wrapper will handle the dynamic number of agents.
-    #    Its n_agents property will report MAX_AGENTS_TRAIN for spec compatibility.
-    variable_agent_env = VariableAgentWrapper(
-        base_vmas_env,
-        max_agents=MAX_AGENTS_TRAIN,
-        min_agents=MIN_AGENTS_TRAIN
-    )
-
-    # 3. Apply other transformations (e.g., RewardSum)
-    #    Ensure keys used by transforms are correct for the MARL "agents" group.
-    #    variable_agent_env.reward_key is ("agents", "reward")
-    #    The output key for RewardSum should also be under "agents" group if it's per-agent episode reward.
+    # Wrap with VariableAgentWrapper for training
     env = TransformedEnv(
-        variable_agent_env,
-        RewardSum(
-            in_keys=[variable_agent_env.reward_key],
-            out_keys=[(variable_agent_env.group_name, "episode_reward")] # e.g. ("agents", "episode_reward")
+        base_env,
+        VariableAgentWrapper(
+            in_keys=[], out_keys=[], # Not strictly used by this wrapper's logic
+            min_n_agents=cfg.env.min_agents_train_lower,
+            max_n_agents=cfg.env.max_agents_train_upper,
+            max_total_agents=cfg.env.max_agents_eval,
+            is_eval=False,
         ),
-        # Optional: Add DoneTransform if needed, but be careful with its effect on done keys
-        # DoneTransform(reward_key=variable_agent_env.reward_key, done_keys=variable_agent_env.done_keys)
     )
+    env = TransformedEnv(
+        env, # Wrap the already wrapped env
+        RewardSum(in_keys=[env.reward_key], out_keys=[("agents", "episode_reward")]),
+    )
+    # Note: The order of transforms matters. RewardSum should see masked rewards.
 
-    # --- Create Test Environment ---
-    # This environment uses a fixed number of agents for evaluation.
-    eval_scenario_cfg = cfg.env.scenario.copy() # Use omegaconf.OmegaConf.to_container if it's a DictConfig
-    if hasattr(eval_scenario_cfg, 'n_agents'): # Ensure we can modify n_agents if it's part of scenario
-        eval_scenario_cfg.n_agents = EVAL_AGENTS
-    else: # If n_agents is a direct kwarg to VmasEnv not in scenario dict
-        pass # VmasEnv will take EVAL_AGENTS from its n_agents param
-
-    env_test = VmasEnv(
+    base_env_test = VmasEnv(
         scenario=cfg.env.scenario_name,
         num_envs=cfg.eval.evaluation_episodes,
         continuous_actions=True,
         max_steps=cfg.env.max_steps,
         device=cfg.env.device,
-        seed=cfg.seed + 1, # Different seed for test env
-        group_map=MarlGroupMapType.ALL_IN_ONE_GROUP,
-        **eval_scenario_cfg,
+        seed=cfg.seed,
+        n_agents=cfg.env.max_agents_eval, # Test env also initialized with max
+        # Scenario kwargs
+        **scenario_kwargs, # Ensure this also uses max_agents_eval for n_agents
     )
-    env_test.frames = [] # for rendering_callback
+    # Wrap with VariableAgentWrapper for evaluation
+    env_test = TransformedEnv(
+        base_env_test,
+        VariableAgentWrapper(
+            in_keys=[], out_keys=[],
+            min_n_agents=cfg.env.eval_n_agents, # Use a specific number for eval
+            max_n_agents=cfg.env.eval_n_agents,
+            max_total_agents=cfg.env.max_agents_eval,
+            is_eval=True,
+            eval_n_agents=cfg.env.eval_n_agents, # Number of agents for this eval run
+        ),
+    )
+    # env_test = TransformedEnv(env_test, RewardSum(...)) # if needed for eval logging
 
-    torchrl_logger.info(f"Training Env action key: {env.action_key}, reward key: {env.reward_key}, done keys: {env.done_keys}")
-    torchrl_logger.info(f"Training Env observation spec: {env.observation_spec}")
-    torchrl_logger.info(f"Training Env action spec: {env.action_spec}")
+    # --- Policy and Critic Networks ---
+    # Initialized for cfg.env.max_agents_eval because observation_spec and action_spec
+    # from the base_env (or wrapped env if spec doesn't change shape) will reflect that.
+    # The GNNActor/Critic should be able to handle variable numbers of active agents
+    # if their inputs (features) are zero for inactive agents.
 
-
-    # Policy and Critic setup
-    # The observation_spec from `env` (which is VariableAgentWrapper) includes ("agents", "active_mask").
-    # The GNNs need to process ("agents", "observation"). The masking of observations for inactive
-    # agents is handled inside the VariableAgentWrapper.
-    # Action spec from `env` is for MAX_AGENTS_TRAIN.
+    # The specs from `env` (which is wrapped) will now include `active_mask`.
+    # The underlying observation and action specs will be for `max_agents_eval`.
     
-    # Get the spec for a single agent's action part for NormalParamExtractor output size
-    # env.action_spec is CompositeSpec({"agents": CompositeSpec({"action": <single_action_spec>}, shape=(MAX_AGENTS,))})
-    # So, env.action_spec[env.action_key] should give the <single_action_spec>
-    action_spec_for_group_agents = None
-    # Check if env.action_spec is a CompositeSpec and contains the group_name key
-    # This would be the case if spec "flattening" (due to deprecation warning) does not occur.
-    if isinstance(env.action_spec, CompositeSpec) and env.group_name in env.action_spec.keys(include_nested=False):
-        action_spec_for_group_agents = env.action_spec[env.group_name]
-    # Check if env.action_spec is already the BoundedContinuous spec for the group
-    # This is the current case based on your logs due to the "leaf-returning" behavior.
-    elif isinstance(env.action_spec, (BoundedContinuous, UnboundedContinuousTensorSpec)) and \
-         hasattr(env.action_spec, "shape") and len(env.action_spec.shape) >= 2: # Expect at least (N_agents, Action_dim)
-        torchrl_logger.info(
-            f"env.action_spec is directly a ContinuousTensorSpec (shape: {env.action_spec.shape}). "
-            f"Assuming it's the action spec for the group '{env.group_name}' due to spec flattening."
-        )
-        action_spec_for_group_agents = env.action_spec
-    else:
-        raise ValueError(
-            f"Unexpected structure for env.action_spec: {env.action_spec} (type: {type(env.action_spec)}). "
-            f"Cannot determine action_spec_for_group_agents for group '{env.group_name}'."
-        )
-
-    # At this point, action_spec_for_group_agents should be a continuous tensor spec like
-    # BoundedContinuous(shape=[batch_size, num_agents, action_dim_per_agent]) or
-    # BoundedContinuous(shape=[num_agents, action_dim_per_agent]) if batch_size is squeezed.
-    if not (isinstance(action_spec_for_group_agents, (BoundedContinuous, UnboundedContinuousTensorSpec)) and \
-            hasattr(action_spec_for_group_agents, "shape") and \
-            len(action_spec_for_group_agents.shape) >= 2): # Needs at least agent dim and action dim
-        raise ValueError(
-            f"action_spec_for_group_agents is not a ContinuousTensorSpec with at least 2 dims. "
-            f"Got: {action_spec_for_group_agents} (type: {type(action_spec_for_group_agents)})"
-        )
-
-    # Extract a single agent's spec by indexing.
-    # This will have shape [action_dim_per_agent] and the correct low/high bounds.
-    if len(action_spec_for_group_agents.shape) == 3: # (Batch, N_agent, Action_dim)
-        single_agent_action_spec = action_spec_for_group_agents[0, 0]
-    elif len(action_spec_for_group_agents.shape) == 2: # (N_agent, Action_dim)
-        single_agent_action_spec = action_spec_for_group_agents[0]
-    else:
-        raise ValueError(
-            f"action_spec_for_group_agents has an unexpected number of dimensions: {action_spec_for_group_agents.shape}. "
-            f"Expected 2 or 3 dimensions (Agent, Action_dim) or (Batch, Agent, Action_dim)."
-        )
-
-    if not hasattr(single_agent_action_spec, "shape"): # Should be guaranteed by above
-        raise TypeError(f"single_agent_action_spec does not have a 'shape' attribute. Spec: {single_agent_action_spec}")
-
-    action_dim = single_agent_action_spec.shape[-1]
-    gnn_output_dim_per_agent = 2 * action_dim # For loc and scale of Normal distribution
-
-    # Observation spec for GNN input
-    # env.observation_spec["agents","observation"] gives the single-agent observation spec
-    single_agent_obs_spec = env.observation_spec[env.group_name]["observation"]
-    obs_dim_per_agent = single_agent_obs_spec.shape[-1]
-
-
+    # Example: action_spec from wrapped env will still be for max_agents_eval
+    # env.action_spec is fine, policy will output for max_agents_eval, wrapper masks it.
+    # env.observation_spec["agents", "observation"] is for max_agents_eval, wrapper masks input.
+    
     gnn_hidden_dim = cfg.model.get("gnn_hidden_dim", 128)
     gnn_layers = cfg.model.get("gnn_layers", 2)
     k_neighbours = cfg.model.get("k_neighbours", None)
-    pos_indices_list = cfg.model.get("pos_indices", [0, 2])
+    pos_indices_list = cfg.model.get("pos_indices", [0, 2]) 
     pos_indices = slice(pos_indices_list[0], pos_indices_list[1])
 
+    # Use observation_spec from the base_env because the wrapper adds a mask
+    # but the GNN itself operates on the raw observation features.
+    # The wrapper ensures that for inactive agents, these features are zeroed out.
+    actor_obs_in_key = ("agents", "observation") # Key the GNN will read
+    critic_obs_in_key = ("agents", "observation")
+
+    actor_net_module = GNNActor(
+        n_agent_inputs=base_env.observation_spec["agents", "observation"].shape[-1], # Use base_env spec for feature size
+        n_agent_outputs=2 * base_env.action_spec.shape[-1], # Use base_env spec for action size
+        gnn_hidden_dim=gnn_hidden_dim,
+        n_gnn_layers=gnn_layers,
+        activation_class=nn.Tanh,
+        k_neighbours=k_neighbours,
+        pos_indices=pos_indices,
+        share_params=cfg.model.shared_parameters,
+        device=cfg.train.device,
+    )
     actor_net = nn.Sequential(
-        GNNActor(
-            n_agent_inputs=obs_dim_per_agent,
-            n_agent_outputs=gnn_output_dim_per_agent, # mu and sigma for each action dimension
-            gnn_hidden_dim=gnn_hidden_dim,
-            n_gnn_layers=gnn_layers,
-            activation_class=nn.Tanh,
-            k_neighbours=k_neighbours,
-            pos_indices=pos_indices,
-            share_params=cfg.model.shared_parameters,
-            device=cfg.train.device,
-        ),
-        NormalParamExtractor(), # Extracts loc and scale
+        actor_net_module,
+        NormalParamExtractor(),
     )
     policy_module = TensorDictModule(
         actor_net,
-        # Input to GNNActor is ("agents", "observation")
-        in_keys=[(env.group_name, "observation")],
-        # Output from NormalParamExtractor will be loc and scale
-        out_keys=[(env.group_name, "loc"), (env.group_name, "scale")],
+        in_keys=[actor_obs_in_key], # Read potentially masked obs
+        out_keys=[("agents", "loc"), ("agents", "scale")],
     )
-
-    # Policy uses the full action spec from the environment (which is for MAX_AGENTS_TRAIN)
-    # env.action_spec should be CompositeSpec(agents: CompositeSpec(action: UnboundedSpec(shape=(act_dim,)), shape=(N,)))
+    
+    # lowest_action should use the spec from the environment the policy interacts with,
+    # which is the wrapped 'env'. Its action_spec is for max_agents_eval.
+    lowest_action = torch.zeros_like(env.action_spec[("agents", "action")].space.low, device=cfg.train.device)
     policy = ProbabilisticActor(
         module=policy_module,
-        spec=env.action_spec.clone(), # Full spec for all agents
-        in_keys=[(env.group_name, "loc"), (env.group_name, "scale")],
-        out_keys=[env.action_key], # e.g. ("agents", "action")
+        spec=env.action_spec, # Spec from the wrapped env (which is for max_total_agents)
+        in_keys=[("agents", "loc"), ("agents", "scale")],
+        out_keys=[env.action_key], # This is ("agents", "action")
         distribution_class=TanhNormal,
         distribution_kwargs={
-            "low": single_agent_action_spec.space.low,  # Use single agent bounds
-            "high": single_agent_action_spec.space.high,
-            "tanh_loc": False # common practice for TanhNormal
+            "low": lowest_action,
+            "high": env.action_spec[("agents", "action")].space.high,
         },
-        return_log_prob=True,
+        return_log_prob=True, # Important for PPO
     )
 
-    critic_net = GNNCritic( # Renamed from critic_module to critic_net for clarity
-        n_agent_inputs=obs_dim_per_agent,
-        # Output is a single value per agent if doing per-agent value estimation
+    critic_net_module = GNNCritic(
+        n_agent_inputs=base_env.observation_spec["agents", "observation"].shape[-1], # Use base_env spec
         gnn_hidden_dim=gnn_hidden_dim,
         gnn_layers=gnn_layers,
         activation_class=nn.Tanh,
-        k_neighbours=k_neighbours, # Use consistent k_neighbours or configure separately
+        k_neighbours=None,
         pos_indices=pos_indices,
         share_params=cfg.model.shared_parameters,
         device=cfg.train.device,
     )
     value_module = ValueOperator(
-        module=critic_net,
-        in_keys=[(env.group_name, "observation")],
-        out_keys=[(env.group_name, "state_value")] # e.g. ("agents", "state_value")
+        module=critic_net_module,
+        in_keys=[critic_obs_in_key], # Read potentially masked obs
+        out_keys=[("agents", "state_value")]
     )
 
     collector = SyncDataCollector(
-        env, # This is the TransformedEnv wrapping VariableAgentWrapper
+        env, # Use the wrapped env
         policy,
-        device=cfg.env.device, # Device for env interaction
-        storing_device=cfg.train.device, # Device for storing data in buffer
+        device=cfg.env.device,
+        storing_device=cfg.train.device,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
-        # If DoneTransform is used, ensure its output keys match what loss expects.
-        # postproc=DoneTransform(reward_key=env.reward_key, done_keys=env.done_keys), # Keep if your DoneTransform is robust
+        postproc=DoneTransform(reward_key=env.reward_key, done_keys=env.done_keys), # DoneTransform should see masked rewards/dones
     )
 
     replay_buffer = TensorDictReplayBuffer(
@@ -285,525 +394,261 @@ def train(cfg: "DictConfig"):  # noqa: F821
         actor_network=policy,
         critic_network=value_module,
         clip_epsilon=cfg.loss.clip_epsilon,
-        entropy_coef=cfg.loss.entropy_eps,
-        normalize_advantage=False, # Consider setting to True if advantages vary widely
+        entropy_coef=cfg.loss.entropy_eps, # We'll handle entropy masking carefully
+        normalize_advantage=False, # Consider True if advantages vary a lot
     )
-    # --- Critical: Set keys for the loss module ---
-    # These keys must match what's in the TensorDict from the collector/replay_buffer.
-    # `env.reward_key` and `env.action_key` are from the wrapper: ("agents", "reward/action")
-    # `done` and `terminated` keys depend on VmasEnv output and any Transforms like DoneTransform.
-    # If VMAS `done` is global (e.g., "done"), and no transform makes it per-agent,
-    # then use "done". If `DoneTransform` or similar creates per-agent done/terminated under
-    # the "agents" group, then use ("agents", "done").
-    # The original code used ("agents", "done"). This implies an expectation of per-agent done signals.
-    # For this refactoring, we'll keep it, assuming it's intended.
-    # The VariableAgentWrapper itself does not make global 'done' per-agent.
-    # It only masks rewards and observations.
-    loss_module.set_keys(
-        reward=env.reward_key,  # ("agents", "reward")
-        action=env.action_key,  # ("agents", "action")
-        done=(env.group_name, "done"), # Assumes per-agent "done" exists, e.g. ("agents", "done")
-        terminated=(env.group_name, "terminated"), # Assumes per-agent "terminated" exists
-        value=(env.group_name, "state_value"), # From value_module: ("agents", "state_value")
-        sample_log_prob=(env.group_name, "sample_log_prob")
-        # Add log_prob if policy doesn't automatically write it to standard key in td.
-        # PPO loss usually expects "sample_log_prob" or similar. ProbabilisticActor adds "sample_log_prob".
-        # Check if the key is ("agents", "sample_log_prob") or just "sample_log_prob" if not grouped by agent.
-        # ProbabilisticActor's out_keys includes env.action_key, and if return_log_prob=True,
-        # it adds "sample_log_prob". This is typically at the root.
-        # If log_prob needs to be per agent for the loss, ensure policy module outputs it per agent.
-        # For now, assume "sample_log_prob" is correctly handled or PPO uses policy directly.
+    loss_module.set_keys( # These keys must exist in the tensordict from the collector
+        reward=env.reward_key, # e.g. ("agents", "reward")
+        action=env.action_key, # e.g. ("agents", "action")
+        done=("agents", "done"), # Make sure this is what DoneTransform produces
+        terminated=("agents", "terminated"), # Make sure this is what DoneTransform produces
+        # The sample_log_prob key is usually handled internally by ProbabilisticActor output
     )
+    # The value estimator (GAE) will use the masked rewards and dones.
+    # If value_module outputs 0 for inactive (zeroed obs) agents, advantage should be 0.
     loss_module.make_value_estimator(
         ValueEstimators.GAE, gamma=cfg.loss.gamma, lmbda=cfg.loss.lmbda
     )
     optim = torch.optim.Adam(loss_module.parameters(), cfg.train.lr)
 
-    # Logging
-    logger = None
-    if cfg.logger.backend:
-        model_name = (
-            ("GNNActor" if isinstance(actor_net[0], GNNActor) else "Het") # Simplified name
-            + ("MA" if cfg.model.centralised_critic else "I") # Assuming centralised_critic means GNN critic uses all obs
-            + "PPO"
-        )
-        logger = init_logging(cfg, model_name)
+    # ... (logging setup) ...
 
     total_time = 0
     total_frames = 0
-    sampling_start_time = time.time()
-
-    pbar = tqdm.tqdm(total=cfg.collector.total_frames) if cfg.train.get("progress_bar", True) else None
-
+    sampling_start = time.time()
     for i, tensordict_data in enumerate(collector):
-        pbar.update(tensordict_data.numel()) if pbar else None
-        
-        # Determine active agents for the *next* rollout.
-        # This is done *before* the data processing for the current batch,
-        # as `set_active_agents` will affect the *next* `_reset` call by the collector.
-        next_n_agents = random.randint(MIN_AGENTS_TRAIN, MAX_AGENTS_TRAIN)
-        
-        # Access the VariableAgentWrapper instance.
-        # `collector.env` is the TransformedEnv. `collector.env.env` is VariableAgentWrapper.
-        current_env_for_wrapper = collector.env 
-        actual_wrapper = None
-        while hasattr(current_env_for_wrapper, "env"):
-            if isinstance(current_env_for_wrapper, VariableAgentWrapper):
-                actual_wrapper = current_env_for_wrapper
-                break
-            current_env_for_wrapper = current_env_for_wrapper.env
-        if isinstance(current_env_for_wrapper, VariableAgentWrapper): # Check if the loop didn't find it but the base is it
-             actual_wrapper = current_env_for_wrapper
+        torchrl_logger.info(f"\nIteration {i}")
+        sampling_time = time.time() - sampling_start
 
+        # tensordict_data now contains ("agents", "active_mask")
+        # and ("agents", "observation"), ("agents", "reward") etc. are masked by VariableAgentWrapper
 
-        if actual_wrapper:
-            actual_wrapper.set_active_agents(next_n_agents)
-            current_num_active_agents = actual_wrapper.current_n_agents
-        else:
-            torchrl_logger.error("Could not find VariableAgentWrapper in the environment chain to set agent count.")
-            current_num_active_agents = "N/A (Wrapper not found)"
-
-        log_string = f"Iter {i}, {current_num_active_agents} agents for next rollout. "
-        sampling_time = time.time() - sampling_start_time
-
-        # Compute GAE advantages
         with torch.no_grad():
-            # Ensure value_estimator gets the correct keys. It uses keys set in loss_module.
+            # GAE calculation: uses masked rewards. If critic outputs ~0 for masked obs, advantage will be ~0.
             loss_module.value_estimator(
-                tensordict_data,
-                params=loss_module.critic_network_params, # Pass learnable parameters
-                target_params=loss_module.target_critic_network_params, # Pass target parameters
+                tensordict_data, # This tensordict has the mask and masked data
+                params=loss_module.critic_network_params,
+                target_params=loss_module.target_critic_network_params,
             )
+        current_frames = tensordict_data.numel() # numel might be tricky if batch_size varies, but usually it's fixed per iter.
+        total_frames += current_frames # Total frames processed by collector
         
-        # `tensordict_data` now contains `("agents", "advantage")` and `("agents", "value_target")`
-        # It also contains `("agents", "active_mask")` from the wrapper (for the current state).
-        # And `("next", "agents", "active_mask")` for the next state.
+        # Reshape and add to replay buffer
+        # The active_mask is part of the data and will be sampled by the buffer
+        data_view = tensordict_data.reshape(-1)
+        replay_buffer.extend(data_view)
 
-        current_frames_collected = tensordict_data.numel() # Number of steps x num_envs
-        total_frames += current_frames_collected
-        
-        # Add to replay buffer. Data is already on cfg.train.device due to collector's storing_device.
-        # `tensordict_data` has shape [vmas_envs, max_steps]. Reshape to [-1] for buffer.
-        replay_buffer.extend(tensordict_data.reshape(-1))
-
-        training_iter_start_time = time.time()
-        cumulative_loss_td = None
-
-        for epoch in range(cfg.train.num_epochs):
+        training_tds = []
+        training_start = time.time()
+        for _ in range(cfg.train.num_epochs):
             for _ in range(cfg.collector.frames_per_batch // cfg.train.minibatch_size):
-                subdata = replay_buffer.sample() # Samples a batch of transitions
-
-                # Get the active_mask for this specific batch of data.
-                # This mask corresponds to the state `s_t`, not `s_{t+1}`.
-                # Shape: [minibatch_size, max_agents, 1]
-                active_mask_batch = subdata.get(variable_agent_env.active_mask_key)
-                if active_mask_batch is None:
-                    raise ValueError(f"Key {variable_agent_env.active_mask_key} not found in sampled subdata.")
-
-                # --- Masking for Loss Calculation ---
-                # ClipPPOLoss might not internally use the "active_mask".
-                # We need to ensure that inactive agents do not contribute to the loss.
-                # This can be done by:
-                # 1. Masking advantages and value_targets (already done by wrapper for rewards, GAE uses these).
-                #    Advantages for inactive agents should be zero if their rewards were zero and values are zero/ignored.
-                #    The `loss_module.value_estimator` calculates GAE. If rewards for inactive agents
-                #    were 0 and their value estimates (from value_module) are also 0 (due to zeroed obs),
-                #    then advantage and value_target should already be 0 for them.
-                #    Explicit masking here is a safeguard or if value network doesn't output exact zero.
+                subdata = replay_buffer.sample() # subdata contains ("agents", "active_mask")
+                active_mask_sample = subdata[("agents", "active_mask")] # Shape: [minibatch_size, max_total_agents]
+                n_active_sample = subdata[("agents", "n_active")] # Shape: [minibatch_size, 1]
                 
-                # Ensure advantage and value_target are shaped [minibatch_size, max_agents, 1 or feature_dim]
-                # Mask is [minibatch_size, max_agents, 1]
-                adv_key = (env.group_name, ValueEstimators.GAE.value) # Default is "advantage"
-                val_target_key = (env.group_name, ValueEstimators.GAE.value_target) # Default is "value_target"
+                # --- Loss Calculation with Masking ---
+                loss_vals_td = loss_module(subdata) # This calls policy and critic
 
-                if adv_key in subdata.keys(True,True):
-                    subdata[adv_key] = subdata[adv_key] * active_mask_batch
-                if val_target_key in subdata.keys(True,True):
-                     subdata[val_target_key] = subdata[val_target_key] * active_mask_batch
+                # Policy loss and value loss should be okay if advantages are correctly zero for inactive agents.
+                # Entropy is the main concern. ClipPPOLoss calculates it as:
+                # entropy = self.actor_network.get_entropy() (if probabilistic actor)
+                # loss_entropy = -self.entropy_coef * masked_ops.mean(entropy)
+                # We need to ensure this mean is only over active agents or adjust.
+
+                # Get per-agent entropy from the policy's distribution
+                # The policy is `loss_module.actor_network`
+                # After loss_module(subdata) is called, subdata is populated with intermediate results
+                # like 'action_log_prob', and potentially 'dist_entropy' if the policy returns it
+                # or if ClipPPOLoss computes and stores it. Let's assume we can get it from the distribution.
                 
-                # 2. Masking log_probs for the policy loss.
-                #    The `sample_log_prob` from ProbabilisticActor is usually at the root.
-                #    If it's per-agent (e.g. ("agents", "sample_log_prob")), it also needs masking.
-                #    If `ClipPPOLoss` sums/means over agent dimension, it needs masking.
-                #    Assuming `ClipPPOLoss` handles this correctly if per-agent terms are zeroed.
-                #    Alternatively, one could implement a masked_mean reduction.
-
-                loss_vals_td = loss_module(subdata) # This tensordict contains 'loss_objective', 'loss_critic', 'loss_entropy'
-
-                # The losses from ClipPPOLoss are typically scalars (already reduced).
-                # If they are not, and are per-agent, they would need masking before reduction.
-                # Example: if loss_objective was per-agent:
-                # loss_objective = (loss_vals_td["loss_objective"] * active_mask_batch.squeeze(-1)).sum() / active_mask_batch.sum()
-
-                total_loss = loss_vals_td["loss_objective"] + loss_vals_td["loss_critic"] + loss_vals_td["loss_entropy"]
+                # If policy is ProbabilisticActor, its last used distribution is stored.
+                # This is a bit of a hack to get the distribution used inside loss_module call.
+                # A cleaner way would be for ClipPPOLoss to accept a mask for entropy calculation.
                 
-                optim.zero_grad()
-                total_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
+                # The `loss_vals_td["loss_entropy"]` is typically `-entropy_coef * entropy.mean()`.
+                # We need to re-calculate this if `entropy.mean()` was over all `max_total_agents`.
+                # Let's get the distribution from the policy AFTER it has processed `subdata`
+                # (which happens inside `loss_module(subdata)` when it computes log_probs)
+                
+                # The `loss_module` itself uses `policy(subdata_clone)` to get log_probs and potentially entropy
+                # `policy.get_dist_params` is called, then `policy.dist_class` is used.
+                # Let's assume `policy.get_entropy(average=False)` would give per-agent entropy.
+                # Or, more robustly, if `loss_vals_td` contains `("agents", "dist_entropy")` [batch, n_agents, 1]
+                # (you might need to ensure your ProbabilisticActor or its distribution provides this)
+
+                # Simplest approach: Assume GNN outputs for inactive agents are such that
+                # their predicted distributions have minimal or zero entropy, or that their
+                # contribution to advantage (and thus policy gradient) is zero.
+                # The most direct way to handle entropy is to make it part of the loss calculation
+                # that can be masked.
+                
+                # If `loss_vals_td["loss_entropy"]` is already a scalar (mean entropy * coef):
+                # Try to re-weight. Total possible entropy slots = batch_size * max_total_agents
+                # Total active entropy slots = active_mask_sample.sum()
+                # If the "mean" in loss_entropy was over max_total_agents, scale it.
+                # This is an approximation.
+                # current_loss_entropy = loss_vals_td["loss_entropy"]
+                # mean_factor = self.max_total_agents / (n_active_sample.float().mean() + 1e-6) # approx
+                # corrected_loss_entropy = current_loss_entropy * mean_factor
+
+                # More robust: If your PPO loss can provide 'entropy_loss_per_agent'
+                # Or, if 'dist_entropy' is available of shape (batch, n_agents) in subdata or from policy:
+                with torch.no_grad(): # Get policy distribution parameters
+                    policy(subdata) # Ensure distribution parameters are populated in subdata
+                dist = policy.get_dist(subdata) # Get the distribution
+                entropy_per_agent = dist.entropy() # Shape [batch_size, max_total_agents, 1] or [batch_size, max_total_agents]
+                if entropy_per_agent.ndim > active_mask_sample.ndim: # e.g. [B,N,1] vs [B,N]
+                    entropy_per_agent = entropy_per_agent.squeeze(-1)
+
+                masked_entropy = entropy_per_agent * active_mask_sample
+                # Average entropy over only active agents per batch item, then average over batch
+                # Handle cases where n_active_sample could be zero for a batch item (though unlikely with min_n_agents > 0)
+                sum_active_agents_per_env = active_mask_sample.sum(dim=1).float()
+                avg_entropy_per_env = masked_entropy.sum(dim=1) / (sum_active_agents_per_env + 1e-6) # Avoid div by zero
+                correct_mean_entropy = avg_entropy_per_env.mean() # Mean over batch
+
+                loss_entropy = -loss_module.entropy_coef * correct_mean_entropy
+                
+                # Replace the potentially incorrect loss_entropy from the module
+                loss_vals_td.set("loss_entropy", loss_entropy) # Update the tensordict
+
+                loss_value = (
+                    loss_vals_td["loss_objective"]
+                    + loss_vals_td["loss_critic"]
+                    + loss_vals_td["loss_entropy"] # Use the corrected one
+                )
+
+                loss_value.backward()
+                total_norm = torch.nn.utils.clip_grad_norm_(
                     loss_module.parameters(), cfg.train.max_grad_norm
                 )
+                # Detach loss_vals_td before storing if it was not already
+                training_tds.append(loss_vals_td.detach())
+                training_tds[-1].set("grad_norm", total_norm.mean().detach())
+
+
                 optim.step()
+                optim.zero_grad()
 
-                # Store detached loss values for logging for this minibatch
-                loss_vals_td = loss_vals_td.detach()
-                loss_vals_td.set("grad_norm", grad_norm.mean()) # grad_norm could be a tensor if many param groups
-                if cumulative_loss_td is None:
-                    cumulative_loss_td = loss_vals_td
-                else:
-                    for key, value in loss_vals_td.items(): # Basic mean accumulation
-                        cumulative_loss_td[key] = (cumulative_loss_td[key] + value) / 2
-
-
-        collector.update_policy_weights_() # Update policy in collector after optimizer step
-        training_time = time.time() - training_iter_start_time
+        collector.update_policy_weights_()
+        training_time = time.time() - training_start
         iteration_time = sampling_time + training_time
         total_time += iteration_time
         
-        log_string += f"Samp T: {sampling_time:.2f}s, Train T: {training_time:.2f}s. "
-        if cumulative_loss_td:
-            log_string += (f"Losses: Obj={cumulative_loss_td['loss_objective']:.3f}, "
-                           f"Crit={cumulative_loss_td['loss_critic']:.3f}, Ent={cumulative_loss_td['loss_entropy']:.3f}. ")
-        torchrl_logger.info(log_string)
+        # Stack training_tds, being careful if they don't have identical keys throughout
+        # This should be fine if loss_module always returns the same set of keys
+        stacked_training_tds = torch.stack(training_tds)
 
 
-        if logger and cumulative_loss_td:
-            log_training( # Your existing logging function
-                logger,
-                cumulative_loss_td.apply(lambda x: x.mean()), # Log mean of losses over epochs/minibatches
-                tensordict_data, # Original collected data for other metrics
-                sampling_time,
-                training_time,
-                total_time,
-                i, # Iteration number
-                current_frames_collected,
-                total_frames,
-                step=total_frames, # Use total_frames as global step for logger
-            )
+        # ... (logging) ...
+        # When logging, you might want to log n_active_agents to see the distribution
+        # For example, in log_training:
+        # logger.log_scalar("train/n_active_agents_mean", tensordict_data[("agents", "n_active")].float().mean().item(), step=step)
 
-        # Evaluation
         if (
             cfg.eval.evaluation_episodes > 0
             and i % cfg.eval.evaluation_interval == 0
+            and cfg.logger.backend
         ):
-            evaluation_start_time = time.time()
+            evaluation_start = time.time()
             with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
-                env_test.frames = [] # Reset frames for this eval run
-                eval_rollouts = env_test.rollout(
+                env_test.frames = [] # Reset frames for rendering
+                # The env_test is already wrapped with VariableAgentWrapper for evaluation
+                rollouts = env_test.rollout(
                     max_steps=cfg.env.max_steps,
-                    policy=policy, # Use the current policy
-                    callback=rendering_callback,
-                    auto_cast_to_device=True, # Ensure policy and env_test are on same device
-                    break_when_any_done=False, # Run all env_test num_envs to completion
+                    policy=policy,
+                    callback=rendering_callback if cfg.eval.render else None, # Add render flag to cfg
+                    auto_cast_to_device=True,
+                    break_when_any_done=False,
                 )
-            evaluation_time = time.time() - evaluation_start_time
-            if logger:
-                log_evaluation(logger, eval_rollouts, env_test, evaluation_time, step=total_frames)
-        
+            evaluation_time = time.time() - evaluation_start
+            log_evaluation(logger, rollouts, env_test, evaluation_time, step=i) # Ensure env_test has n_agents attribute if logger uses it
+
+            
+            if not env_test.is_closed: # Close test env after eval
+                env_test.close()
+
+
         if cfg.logger.backend == "wandb" and logger:
-             logger.experiment.log({}, commit=True) # Ensure all data is flushed
+            logger.experiment.log({}, commit=True)
+        
+        # No need to restart sampling_start here, it's at the beginning of the loop
+        # sampling_start = time.time()
 
-        sampling_start_time = time.time() # Reset for next iteration's sampling time
+    # Shutdown final training collector and env
+    if "collector" in locals() and collector is not None:
+        collector.shutdown()
+    if "env" in locals() and env is not None and not env.is_closed:
+        env.close()
+    if "env_test" in locals() and env_test is not None and not env_test.is_closed: # Ensure test_env is also closed
+        env_test.close()
 
-    collector.shutdown()
-    if not env.is_closed: env.close()
-    if not env_test.is_closed: env_test.close()
-    if pbar: pbar.close()
-    torchrl_logger.info(f"Training ended. Total time: {total_time / 3600:.2f} hours.")
-
-
-
-
-
-class VariableAgentWrapper(EnvBase):
-    """
-    A wrapper for multi-agent environments like VmasEnv to handle a variable
-    number of active agents during execution, up to a predefined maximum.
-
-    The wrapper maintains fixed tensor shapes based on `max_agents` but uses
-    an "active_mask" to indicate which agents are currently participating.
-    Observations, actions, and rewards for inactive agents are masked (typically zeroed out).
-
-    Args:
-        env (VmasEnv): The VmasEnv instance to wrap. Assumed to be initialized with n_agents = max_agents.
-        max_agents (int): The maximum number of agents the environment can support (and tensor shapes are based on).
-        min_agents (int): The minimum number of agents that can be active.
-    """
-    def __init__(self, env: EnvBase, max_agents: int, min_agents: int):
-        if not isinstance(env, EnvBase):
-            raise TypeError("The wrapped environment must be an instance of torchrl.envs.EnvBase.")
-
-        # Initialize EnvBase with device and batch_size from the wrapped env
-        super().__init__(device=env.device, batch_size=env.batch_size)
-
-        self.env = env
-        self.max_agents = max_agents
-        self.min_agents = min_agents
-        self._current_n_agents = self.max_agents # Default to max
+        # ... (rest of the loop and shutdown) ...
+    # ... (shutdown)
 
 
-        # --- Define Group Name and Keys ---
-        # Determine the group name from the wrapped env (usually "agents" for ALL_IN_ONE_GROUP)
-        # EnvBase properties like self.action_key depend on this.
-        if not hasattr(env, "group_map") or not env.group_map:
-             # Attempt to infer from spec structure, default to "agents"
-             found_group = None
-             if isinstance(env.action_spec, CompositeSpec) and len(env.action_spec.keys(False)) == 1:
-                 found_group = list(env.action_spec.keys(False))[0]
-             self.group_name = found_group if found_group else "agents"
-             torchrl_logger.warning(f"Wrapped env has no group_map, inferred group_name='{self.group_name}'")
-        elif len(env.group_map) == 1:
-             self.group_name = list(env.group_map.keys())[0]
-        else:
-             # If multiple groups exist, this wrapper logic might need adaptation.
-             # For now, assume a single group as per ALL_IN_ONE_GROUP.
-             raise ValueError("VariableAgentWrapper currently assumes a single agent group in the wrapped env.")
-
-        self.group_name = "agents"
-
-        self.active_mask_key = (self.group_name, "active_mask")
-        self.observation_key = (self.group_name, "observation") # Cache for convenience
-
-        # --- Specs ---
-        # Simply clone the specs from the wrapped environment. They already have the
-        # correct structure (nested group), batch size, and max_agents dimension.
-        self.action_spec = self.env.action_spec.clone()
-        self.reward_spec = self.env.reward_spec.clone()
-        self.done_spec = self.env.done_spec.clone() # Usually global
-        self.observation_spec = self.env.observation_spec.clone() # Clone the whole CompositeSpec
 
 
-        # --- Add the active_mask spec ---
-        try:
-            # Get the parent CompositeSpec for the agent group
-            group_composite_spec = self.observation_spec[self.group_name]
-            if not isinstance(group_composite_spec, CompositeSpec):
-                 raise TypeError(f"Expected observation_spec['{self.group_name}'] to be CompositeSpec.")
+def rendering_callback(env, td):
+    # Check if frames attribute exists, if not, create it
+    if not hasattr(env, "frames"):
+        env.frames = []
+    env.frames.append(env.render(mode="rgb_array", agent_index_focus=None))
 
-            # Determine the full shape needed for the mask spec
-            # It must match the parent composite's shape plus the mask's feature dim (1)
-            # parent_shape is e.g., torch.Size([30, 8])
-            parent_shape = group_composite_spec.shape
-            mask_feature_shape = torch.Size([1]) # Single boolean mask per agent
-            active_mask_full_shape = parent_shape + mask_feature_shape
-            # e.g., torch.Size([30, 8, 1])
+# Helper function to create environment
+def create_env(cfg, n_agents_override=None, is_eval=False):
+    num_envs = cfg.eval.evaluation_episodes if is_eval else cfg.env.vmas_envs
+    
+    # Determine n_agents
+    if n_agents_override is not None:
+        current_n_agents = n_agents_override
+    elif hasattr(cfg.env.scenario, "n_agents"): # If n_agents is part of scenario config
+        current_n_agents = cfg.env.scenario.n_agents
+    else: # Fallback or error, VMAS scenarios usually define n_agents
+        # This might need adjustment based on how your VMAS scenario expects n_agents
+        # For example, some scenarios have n_agents fixed.
+        # If your scenario is like "balance" which expects a certain number,
+        # you might need different scenario files or a scenario that adapts.
+        # For this example, let's assume n_agents can be passed to the scenario config.
+        # If n_agents is a direct kwarg to VmasEnv not in scenario:
+        # current_n_agents = default_value # or handle error
+        raise ValueError("n_agents not specified in cfg.env.scenario and not overridden")
 
-            # Create the DiscreteTensorSpec with the *full* required shape
-            # Note: Use CategoricalSpec as DiscreteTensorSpec is deprecated
-            active_mask_spec = Categorical(
-                n=2, # Equivalent to boolean
-                shape=active_mask_full_shape, # Full shape including batch and agent dims
-                dtype=torch.bool,
-                device=self.device
-            )
-
-            # Add the correctly shaped spec to the group composite spec
-            group_composite_spec.set("active_mask", active_mask_spec)
-
-            # Verification check (optional but good practice)
-            if "active_mask" not in group_composite_spec.keys(False):
-                raise RuntimeError("Failed to add 'active_mask' key to observation_spec group.")
-            if group_composite_spec["active_mask"].shape != active_mask_full_shape:
-                 raise RuntimeError(f"Added mask spec has wrong shape: {group_composite_spec['active_mask'].shape} vs {active_mask_full_shape}")
-
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to add active_mask_spec to the cloned observation_spec. "
-                f"Check structure of env.observation_spec: {self.env.observation_spec}. Error: {e}"
-            ) from e
+    scenario_kwargs = cfg.env.scenario.copy() # Make a copy to modify
+    # Update n_agents in scenario_kwargs if it's a scenario parameter
+    # The exact key 'n_agents' might vary based on your specific VMAS scenario implementation
+    # Common practice for VMAS scenarios is to have 'n_agents' as a parameter.
+    if hasattr(cfg.env.scenario, "n_agents") or n_agents_override is not None:
+         scenario_kwargs.n_agents = current_n_agents
 
 
-        # Initialize the actual mask tensor (_active_mask_value) used at runtime
-        # Shape: [*batch_dims, max_agents, 1]
-        self._active_mask_value = torch.ones(
-            *self.batch_size, self.max_agents, 1,
-            dtype=torch.bool,
-            device=self.device
+    env = VmasEnv(
+        scenario=cfg.env.scenario_name,
+        num_envs=num_envs,
+        continuous_actions=True,
+        max_steps=cfg.env.max_steps,
+        device=cfg.env.device,
+        seed=cfg.seed + (1000 if is_eval else 0), # Ensure different seed for test env if needed
+        # Scenario kwargs
+        **scenario_kwargs, # Pass modified scenario arguments
+        # If n_agents is a direct argument to VmasEnv, not part of scenario:
+        # n_agents=current_n_agents,
+    )
+    
+    # The reward key might change if n_agents changes and results in different group structure
+    # However, with a single "agents" group, env.reward_key should remain ("agents", "reward")
+    # Ensure DoneTransform uses the correct done_keys from the newly created env
+    # and reward_key
+    env = TransformedEnv(
+        env,
+        Compose( # Use Compose for multiple transforms
+            RewardSum(in_keys=[env.reward_key], out_keys=[("agents", "episode_reward")]),
+            # DoneTransform might need to be adapted if it assumes fixed done_keys structure.
+            # However, env.done_keys should reflect the current env.
+            DoneTransform(reward_key=env.reward_key, done_keys=env.done_keys)
         )
-        self.set_active_agents(self._current_n_agents) # Initialize mask based on default
-
-        # Log initialization success and key info
-        torchrl_logger.info(
-             f"VariableAgentWrapper initialized. Batch: {self.batch_size}, Device: {self.device}. "
-             f"Group: '{self.group_name}'. Agents: {self.min_agents}-{self.max_agents} (current: {self._current_n_agents})."
-        )
-        # Log keys derived from EnvBase properties (which use self.group_name and the specs)
-        torchrl_logger.debug(f" Wrapper Action key: {self.action_key}")
-        torchrl_logger.debug(f" Wrapper Reward key: {self.reward_key}")
-        torchrl_logger.debug(f" Wrapper Done keys: {self.done_keys}")
-        torchrl_logger.debug(f" Wrapper Active mask key: {self.active_mask_key}")
-        torchrl_logger.debug(f" Wrapper Observation Spec: {self.observation_spec}")
-
-    def set_active_agents(self, n_agents: int):
-        if not (self.min_agents <= n_agents <= self.max_agents):
-            raise ValueError(f"Requested n_agents ({n_agents}) is out of configured range [{self.min_agents}, {self.max_agents}].")
-        self._current_n_agents = n_agents
-
-        # Create the core mask for the agent dimension
-        mask_core = torch.arange(self.max_agents, device=self.device) < n_agents # Shape [max_agents]
-
-        # Expand to full dimensions: [*batch_dims, max_agents, 1]
-        # This shape is convenient for broadcasting with agent-specific data like observations (..., N, D_obs) or rewards (..., N, 1)
-        self._active_mask_value = mask_core.view(1, self.max_agents, 1).expand(
-            *self.batch_size, self.max_agents, 1
-        ).clone()
-        # print(f"VariableAgentWrapper: Set active agents to {self._current_n_agents}. Mask shape: {self._active_mask_value.shape} on device {self._active_mask_value.device}")
-
-
-    def _get_current_active_mask(self) -> torch.Tensor:
-        """Returns the active mask tensor, e.g., shape (*batch_size, max_agents, 1)."""
-        return self._active_mask_value
-
-    def _reset(self, tensordict: TensorDict | None = None, **kwargs) -> TensorDict:
-        # Reset the underlying environment. It operates with self.max_agents.
-        td_reset = self.env._reset(tensordict, **kwargs)
-
-        current_mask = self._get_current_active_mask()
-
-        # Add the active_mask to the outgoing tensordict for the initial observation
-        # The spec for ("agents", "active_mask") is for a single agent (shape [1]),
-        # TensorDict handles the batching and agent dimension.
-        td_reset[self.active_mask_key] = current_mask # Shape [*B, N_max, 1]
-
-        # Zero out observations for inactive agents
-        # td_reset[("agents", "observation")] has shape [*B, N_max, obs_dim]
-        # current_mask has shape [*B, N_max, 1], broadcasts correctly.
-        if self.observation_key in td_reset.keys(include_nested=True):
-            td_reset[self.observation_key] = td_reset[self.observation_key] * current_mask
-        else:
-            # This should not happen if VmasEnv conforms to standard "agents" grouping.
-            raise KeyError(f"Observation key {self.observation_key} not found in td_reset from wrapped env. Keys: {td_reset.keys(True,True)}")
-
-        return td_reset
-
-    def _step(self, tensordict: TensorDict) -> TensorDict:
-        current_mask = self._get_current_active_mask() # Shape [*B, N_max, 1]
-
-        # Mask actions for inactive agents before passing to the underlying environment
-        if self.action_key not in tensordict.keys(include_nested=True):
-            raise KeyError(f"Action key {self.action_key} not found in input tensordict to _step. Keys: {tensordict.keys(True,True)}")
-
-        # Make a copy if you need to preserve original actions from policy for logging,
-        # but usually the effectively taken action (masked) is what's important.
-        # original_actions = tensordict[self.action_key].clone()
-        tensordict[("agents",self.action_key)] = tensordict[self.action_key] * current_mask # Zero out actions for inactive
-
-        # Step the underlying environment with the (potentially masked) actions
-        breakpoint()
-        td_out = self.env._step(tensordict)
-
-        # --- Process the output tensordict (td_out) ---
-
-        # 1. Add the active_mask for the *next* state's observation
-        # Key for the mask in the *next* part of the tensordict.
-        next_active_mask_key = ("next", self.active_mask_key) # e.g., ("next", "agents", "active_mask")
-        td_out[next_active_mask_key] = current_mask.clone() # Or re-fetch if it could change mid-step (unlikely here)
-
-        # 2. Mask rewards for inactive agents in the *next* state
-        # td_out["next", self.reward_key] e.g., ("next", "agents", "reward")
-        next_reward_key_nested = ("next", self.reward_key)
-        if next_reward_key_nested not in td_out.keys(include_nested=True):
-            # This might happen if "reward" is not under "next" or structured differently.
-            # VmasEnv with ALL_IN_ONE_GROUP should place ("next", "agents", "reward").
-            torchrl_logger.warning(f"Reward key {next_reward_key_nested} not found in td_out from self.env._step. td_out keys: {td_out.keys(True,True)}")
-        else:
-            reward_val = td_out[next_reward_key_nested]
-            # Ensure mask is broadcastable to reward shape.
-            # If reward is [*B, N, D_rew] and mask is [*B, N, 1].
-            # If reward is scalar per agent, D_rew=1, direct multiply works.
-            # If reward is truly scalar per agent (e.g. shape [*B, N]), mask needs squeeze.
-            if reward_val.dim() == current_mask.dim() and reward_val.shape[-1] == current_mask.shape[-1]: # Both are e.g. [B,N,1]
-                 masked_reward = reward_val * current_mask
-            elif reward_val.dim() == current_mask.dim() - 1 and current_mask.shape[-1] == 1: # Reward [B,N], Mask [B,N,1]
-                 masked_reward = reward_val * current_mask.squeeze(-1)
-            elif reward_val.dim() == current_mask.dim() and current_mask.shape[-1] == 1: # Reward [B,N,D_rew], Mask [B,N,1]
-                 masked_reward = reward_val * current_mask # Broadcasting
-            else:
-                raise ValueError(f"Cannot broadcast reward (shape {reward_val.shape}) with mask (shape {current_mask.shape})")
-            td_out[next_reward_key_nested] = masked_reward
-
-
-        # 3. Zero out next_observations for inactive agents
-        # td_out[("next", "agents", "observation")]
-        next_obs_key_nested = ("next", self.observation_key)
-        if next_obs_key_nested not in td_out.keys(include_nested=True):
-            torchrl_logger.warning(f"Next observation key {next_obs_key_nested} not found in td_out from self.env._step. td_out keys: {td_out.keys(True,True)}")
-        else:
-            td_out[next_obs_key_nested] = td_out[next_obs_key_nested] * current_mask
-
-
-        # 4. Done flags:
-        # VmasEnv 'done' (and 'terminated') is typically global (e.g., td_out["done"] or td_out["next","done"]).
-        # As such, it's usually not masked per individual agent's activity by this wrapper.
-        # If 'done' were per-agent under ("next", "agents", "done"), it would need masking:
-        #   per_agent_done_key = ("next", self.group_name, "done")
-        #   if per_agent_done_key in td_out.keys(include_nested=True):
-        #       td_out[per_agent_done_key] = td_out[per_agent_done_key] & current_mask.squeeze(-1) # Logical AND
-
-        return td_out
-
-    def _set_seed(self, seed: int | None):
-        # Seed the underlying environment. EnvBase handles the call to _set_seed.
-        self.env.set_seed(seed)
-
-    @property
-    def lib(self): # Delegate to underlying env if it has 'lib' (like VmasEnv for rendering)
-        return getattr(self.env, 'lib', None)
-
-    def render(self, *args, **kwargs): # Delegate common methods
-        if hasattr(self.env, 'render'):
-            return self.env.render(*args, **kwargs)
-        raise NotImplementedError(f"Wrapped environment {type(self.env)} does not support render.")
-
-    def close(self):
-        if not self.is_closed: # property from EnvBase
-            if hasattr(self.env, 'close'):
-                self.env.close()
-            super().close() # Marks this wrapper instance as closed
-
-    @property
-    def n_agents(self) -> int:
-        # This property should reflect the tensor dimensions, which are based on max_agents.
-        return self.max_agents
-
-    @property
-    def current_n_agents(self) -> int:
-        # Returns the currently active number of agents.
-        return self._current_n_agents
-
-    # For completeness, delegate state_dict/load_state_dict if the wrapper itself had more state.
-    # For now, only current_n_agents is specific to the wrapper's dynamic behavior beyond the env's state.
-    def state_dict(self, **kwargs) -> dict:
-        # Basic state dict, can be expanded if wrapper has more state
-        wrapped_env_state = self.env.state_dict(**kwargs) if hasattr(self.env, 'state_dict') else {}
-        return {
-            "_current_n_agents": self._current_n_agents,
-            "env_state_dict": wrapped_env_state
-        }
-
-    def load_state_dict(self, state_dict: dict, **kwargs):
-        self._current_n_agents = state_dict["_current_n_agents"]
-        self.set_active_agents(self._current_n_agents) # Crucial to re-apply mask state
-        if hasattr(self.env, 'load_state_dict') and "env_state_dict" in state_dict:
-            self.env.load_state_dict(state_dict["env_state_dict"], **kwargs)
-
-    def __repr__(self) -> str:
-        return (f"{self.__class__.__name__}("
-                f"env={self.env}, "
-                f"max_agents={self.max_agents}, min_agents={self.min_agents}, "
-                f"current_n_agents={self._current_n_agents})")
-
+    )
+    return env
 
 if __name__ == "__main__":
-    # For tqdm and other utilities that might be missing
-    try:
-        import tqdm
-    except ImportError:
-        print("tqdm not found, progress bar will be disabled. pip install tqdm")
-        # Create a dummy tqdm if not found, so pbar related lines don't crash
-        class dummy_tqdm:
-            def __init__(self, *args, **kwargs): pass
-            def update(self, *args, **kwargs): pass
-            def close(self, *args, **kwargs): pass
-        tqdm = dummy_tqdm
-
     train()
