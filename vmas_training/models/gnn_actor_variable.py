@@ -284,5 +284,28 @@ class GNNActorVariable(nn.Module):
                 if agent_mask[b, a]:
                     final_output[b, a] = agent_outputs[current_idx]
                     current_idx += 1
+
+        # Before returning the final output, ensure scale values aren't exactly zero:
+        batch_size, n_agents, output_dim = final_output.shape
+        half_dim = output_dim // 2
+        
+        # Split into loc and scale
+        loc = final_output[:, :, :half_dim]
+        scale_raw = final_output[:, :, half_dim:]
+        
+        # Get the agent mask
+        agent_mask = torch.any(obs != 0, dim=2, keepdim=True).expand(-1, -1, half_dim)
+        
+        # Apply mask to loc (zeros for inactive agents)
+        loc = loc * agent_mask
+        
+        # For scale: use small positive values (epsilon) for inactive agents
+        # This prevents broadcasting issues while ensuring inactive agents produce near-zero variance
+        epsilon = 1e-6
+        scale_safe = scale_raw * agent_mask + epsilon * (~agent_mask)
+        
+        # Recombine and return
+        final_output = torch.cat([loc, scale_safe], dim=2)
         
         return final_output
+            

@@ -5,6 +5,8 @@ import random  # Added for randomizing agent numbers
 import hydra
 import torch
 
+import torch.distributions as td
+from torch.distributions.transforms import TanhTransform
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
 from torch import nn
@@ -22,6 +24,110 @@ from utils.logging import init_logging, log_evaluation, log_training
 from utils.utils import DoneTransform
 from models.gnn_actor_variable import GNNActorVariable
 from models.gnn_critic import GNNCritic
+
+
+
+# TODO: ENSURE THIS IS WORKING. DO SOME DEBUGGING AND TESTS https://claude.ai/share/ff284144-4019-4957-9736-cec9cbcde913
+class MaskedTanhNormal(TanhNormal):
+    def __init__(self, loc, scale, low=None, high=None):
+        # Get the mask from non-zero values in loc
+        self._mask = (loc.abs().sum(dim=-1, keepdim=True) > 1e-8)
+        
+        # Create a base normal distribution with consistent parameters
+        # Default scale to small positive value where masked
+        scale_safe = scale.clone()
+        scale_safe = torch.where(self._mask.expand_as(scale), scale, torch.ones_like(scale) * 1e-8)
+        
+        # Create the base distribution (Normal)
+        normal_dist = td.Normal(loc, scale_safe)
+        
+        # Apply TanhTransform with a simple Jacobian adjustment
+        transforms = [TanhTransform()]
+        
+        # Create a TransformedDistribution directly (bypassing TanhNormal's __init__)
+        self.base_dist = normal_dist
+        self.transforms = transforms
+        self._low = low
+        self._high = high
+        
+        # Make it work with the rest of TorchRL
+        self._event_shape = self.base_dist.event_shape
+        self._batch_shape = self.base_dist.batch_shape
+
+class SafeNormalParamExtractor(NormalParamExtractor):
+    def forward(self, x):
+        # Original behavior - split into mean and std
+        loc, scale_params = x.chunk(2, dim=-1)
+        scale = torch.nn.functional.softplus(scale_params)
+        
+        # Fix for masked agents - ensure non-zero scale values
+        mask = torch.any(loc != 0, dim=-1, keepdim=True)
+        scale_safe = scale * mask + 1e-6 * (~mask)
+        
+        return loc, scale_safe
+
+class VariableAgentsPPOLoss(ClipPPOLoss):
+    def forward(self, tensordict):
+        # Store the original tensordict
+        original_td = tensordict.clone()
+        
+        # Get observations and extract agent dimensions
+        obs = tensordict.get(("agents", "observation"))
+        batch_size, n_agents, obs_dim = obs.shape
+        
+        # Extract log probabilities and advantages
+        log_prob = tensordict.get("sample_log_prob")
+        old_log_prob = tensordict.get("old_sample_log_prob")
+        advantage = tensordict.get("advantage")
+        
+        # Print initial shapes
+        # print(f"Initial shapes: log_prob {log_prob.shape}, advantage {advantage.shape}")
+        
+        # Check if shapes match in agent dimension (dim 1)
+        if log_prob.shape[1] != advantage.shape[1]:
+            # print(f"Shape mismatch in agent dimension: log_prob {log_prob.shape}, advantage {advantage.shape}")
+            min_agents = min(log_prob.shape[1], advantage.shape[1])
+            log_prob = log_prob[:, :min_agents]
+            old_log_prob = old_log_prob[:, :min_agents]
+            advantage = advantage[:, :min_agents]
+            tensordict.set("sample_log_prob", log_prob)
+            tensordict.set("old_sample_log_prob", old_log_prob)
+            tensordict.set("advantage", advantage)
+            
+            if "state_value" in tensordict:
+                state_value = tensordict.get("state_value")
+                if state_value.shape[1] != min_agents:
+                    tensordict.set("state_value", state_value[:, :min_agents])
+        
+        # Reshape advantage to match expected format for PPO calculations
+        # We need to ensure it will be compatible with log_weight which is [batch, agents, action_dim, 1]
+        if advantage.shape[-1] != log_prob.shape[-1]:
+            # print(f"Shape mismatch in action dimension: log_prob {log_prob.shape}, advantage {advantage.shape}")
+            # First expand advantage to match action dimension
+            advantage = advantage.expand(*advantage.shape[:-1], log_prob.shape[-1])
+        
+        # Crucial fix: Add an extra dimension to advantage to match log_weight's shape
+        # This ensures advantage shape is [batch, agents, action_dim, 1] to match log_weight
+        advantage = advantage.unsqueeze(-1)
+        tensordict.set("advantage", advantage)
+        
+        # print(f"After correction: advantage shape {advantage.shape}")
+        
+        # Call the parent implementation with corrected tensors
+        try:
+            loss_dict = super().forward(tensordict)
+        except RuntimeError as e:
+            # If still having issues, print more diagnostic info and re-raise
+            print(f"Error in PPO calculation. Advantage shape: {advantage.shape}")
+            print(f"Error message: {str(e)}")
+            raise
+        
+        # Restore original tensordict for the next iteration
+        for key in original_td.keys():
+            if key not in loss_dict:
+                tensordict.set(key, original_td.get(key))
+        
+        return loss_dict
 
 # New class to handle variable number of agents
 class VariableAgentsWrapper(TransformedEnv):
@@ -133,7 +239,6 @@ class VariableAgentsWrapper(TransformedEnv):
 
 def rendering_callback(env, td):
     env.frames.append(env.render(mode="rgb_array", agent_index_focus=None))
-
 
 class VmasEnvFactory:
     def __init__(self, cfg):
@@ -254,7 +359,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
             device=cfg.train.device,
             # Add agent_mask support in your GNN implementation
         ),
-        NormalParamExtractor(),
+        SafeNormalParamExtractor(),
     )
     
     policy_module = TensorDictModule(
@@ -265,13 +370,12 @@ def train(cfg: "DictConfig"):  # noqa: F821
     
     lowest_action = torch.zeros_like(env.full_action_spec_unbatched[("agents", "action")].space.low, device=cfg.train.device)
 
-
     policy = ProbabilisticActor(
         module=policy_module,
         spec=env.full_action_spec_unbatched,
         in_keys=[("agents", "loc"), ("agents", "scale")],
         out_keys=[env.action_key],
-        distribution_class=TanhNormal,
+        distribution_class=MaskedTanhNormal,
         distribution_kwargs={
             "low": lowest_action,
             "high": env.full_action_spec_unbatched[("agents", "action")].space.high,
@@ -315,7 +419,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     )
 
     # Loss
-    loss_module = ClipPPOLoss(
+    loss_module = VariableAgentsPPOLoss(
         actor_network=policy,
         critic_network=value_module,
         clip_epsilon=cfg.loss.clip_epsilon,

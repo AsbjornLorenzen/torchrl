@@ -985,6 +985,8 @@ class ClipPPOLoss(PPOLoss):
             ess = (2 * lw.logsumexp(0) - (2 * lw).logsumexp(0)).exp()
             batch = log_weight.shape[0]
 
+        # print(f"log_weight shape: {log_weight.shape}")
+        # print(f"advantage shape: {advantage.shape}")
         gain1 = log_weight.exp() * advantage
 
         log_weight_clip = log_weight.clamp(*self._clip_bounds)
