@@ -24,111 +24,112 @@ from models.gnn_actor_variable import GNNActorVariable
 from models.gnn_critic_variable import GNNCriticVariable
 
 # New class to handle variable number of agents
-class VariableAgentsWrapper(TransformedEnv):
-    def __init__(self, env, min_agents=4, max_agents=8, fixed_num_agents=None):
-        super().__init__(env)
-        self.base_env = env
+class DynamicAgentsManager:
+    """
+    Manages environments with a dynamically changing number of agents.
+    Creates a new environment instance for each different agent count.
+    """
+    def __init__(
+        self,
+        scenario_name,
+        num_envs,
+        min_agents,
+        max_agents,
+        continuous_actions=True,
+        max_steps=200,
+        device="cpu",
+        seed=None,
+        **scenario_kwargs
+    ):
+        self.scenario_name = scenario_name
+        self.num_envs = num_envs
         self.min_agents = min_agents
         self.max_agents = max_agents
-        self.fixed_num_agents = fixed_num_agents
-        self.current_num_agents = max_agents - 1 # Just for testing purposes
-         
-        # Maximum number of agents we'll ever use (for evaluation too)
-        self.max_possible_agents = max(max_agents, fixed_num_agents or 0)
+        self.continuous_actions = continuous_actions
+        self.max_steps = max_steps
+        self.device = device
+        self.seed = seed
+        self.scenario_kwargs = scenario_kwargs
         
-        # Add agent_mask to the observation space
-        # self._update_specs()
+        # Cache for created environments (key: num_agents)
+        self.env_cache = {}
+        
+        # Current active environment
+        self.current_num_agents = None
+        self.current_env = None
+        
+        # Create initial environment with default agent count
+        self.set_num_agents(max_agents)
     
-    # def _update_specs(self):
-    #     # We add an agent_mask field to the observation space
-    #     self.observation_spec = self.base_env.observation_spec.clone()
-    #     # Add a boolean mask to indicate which agents are active
-    #     self.observation_spec.set(
-    #         ("agents", "agent_mask"), 
-    #         torch.zeros(
-    #             (*self.base_env.batch_size, self.max_possible_agents, 1), 
-    #             dtype=torch.bool, 
-    #             device=self.base_env.device
-    #         )
-    #     )
-
-    def set_num_agents(self, num_agents: int | None):
+    def set_num_agents(self, num_agents):
         """
-        Sets a fixed number of agents for subsequent environment resets.
-        If num_agents is None, the number of agents will be randomized
-        between self.min_agents and self.max_agents during resets.
+        Set the active number of agents by either retrieving a cached environment
+        or creating a new one with the specified number of agents.
         """
+        if num_agents < self.min_agents or num_agents > self.max_agents:
+            raise ValueError(f"Number of agents must be between {self.min_agents} and {self.max_agents}")
+        
         self.current_num_agents = num_agents
-        # You could add a log here if desired:
-        if num_agents is not None:
-            print(f"VariableAgentsWrapper: Number of active agents for next episodes set to {num_agents}")
-        else:
-            print(f"VariableAgentsWrapper: Number of active agents for next episodes will be randomized ({self.min_agents}-{self.max_agents})")
-    
-    def _reset(self, tensordict=None, **kwargs):
-        # Reset the underlying environment
-        td = self.base_env._reset(tensordict, **kwargs)
         
-        # Choose number of active agents for this episode
-        if self.fixed_num_agents is None:
-            num_active_agents = self.current_num_agents
-        else:
-            num_active_agents = self.fixed_num_agents
-            
-        # Create a mask for active agents
-        self.agent_mask = torch.zeros(
-            (*self.base_env.batch_size, self.max_possible_agents, 1), 
-            dtype=torch.bool, 
-            device=self.base_env.device
+        # If we already have an environment with this agent count, use it
+        if num_agents in self.env_cache:
+            print(f"Using cached environment with {num_agents} agents")
+            self.current_env = self.env_cache[num_agents]
+            return self.current_env
+        
+        # Otherwise create a new environment
+        print(f"Creating new environment with {num_agents} agents")
+        base_env = VmasEnv(
+            scenario=self.scenario_name,
+            num_envs=self.num_envs,
+            n_agents=num_agents,  # Exactly the number we need
+            continuous_actions=self.continuous_actions,
+            max_steps=self.max_steps,
+            device=self.device,
+            seed=self.seed,
+            **self.scenario_kwargs
         )
         
-        # Set first num_active_agents to True (active)
-        self.agent_mask[..., :num_active_agents, :] = True
-        print(f"For {num_active_agents} active agents, mask is {self.agent_mask}")
+        # Apply standard transformations
+        env = TransformedEnv(
+            base_env,
+            RewardSum(in_keys=[base_env.reward_key], out_keys=[("agents", "episode_reward")]),
+        )
         
-        # Add the agent mask to the tensordict
-        # TEMP: NO AGENT MASK PASSED HERE
-        # td.set(("agents", "agent_mask"), agent_mask)
+        # Cache for future use
+        self.env_cache[num_agents] = env
+        self.current_env = env
         
-        # Zero out observations for inactive agents
-        obs = td.get(("agents", "observation"))
-        obs = obs * self.agent_mask.expand_as(obs[:, :, :1])  # Use broadcasting to mask observations
-        td.set(("agents", "observation"), obs)
-        print(f"In reset after applying mask, td is {td}")
-        
-        return td
+        return env
     
-    def _step(self, tensordict):
-        # Get the agent mask
-        # agent_mask = tensordict.get(("agents", "agent_mask"))
-        # TEMP
-
-        # Mask the actions for inactive agents (set to zero)
-        actions = tensordict.get(self.base_env.action_key)
-        masked_actions = actions * self.agent_mask.expand_as(actions[:, :, :1])
-        tensordict.set(self.base_env.action_key, masked_actions)
-        print(f"Set actionkeys as {tensordict[self.base_env.action_key][:,:,0]}")
-        
-        # Forward to the base environment
-        print(f"In step before forward, tensordict is {tensordict}")
-        td = self.base_env._step(tensordict)
-        print(f"In step after forward, tensordict is {td}")
-        
-        # Propagate the mask to the next state
-        # TEMP NO MASK
-        # td.set(("agents", "agent_mask"), agent_mask)
-        
-        # Mask observations and rewards for inactive agents
-        obs = td.get(("agents", "observation"))
-        obs = obs * self.agent_mask.expand_as(obs[:, :, :1])
-        td.set(("agents", "observation"), obs)
-        
-        rewards = td.get(self.base_env.reward_key)
-        rewards = rewards * self.agent_mask
-        td.set(self.base_env.reward_key, rewards)
-        print(f"Before returning obs and rew, mask is {td}")
-        
-        return td
+    def get_current_env(self):
+        """Returns the currently active environment"""
+        return self.current_env
+    
+    def get_current_num_agents(self):
+        """Returns the current number of agents"""
+        return self.current_num_agents
+    
+    def random_num_agents(self):
+        """Randomly select a number of agents and set the environment accordingly"""
+        num_agents = random.randint(self.min_agents, self.max_agents)
+        return self.set_num_agents(num_agents)
+    
+    def get_specs(self):
+        """Get the current environment's specifications"""
+        return {
+            "observation_spec": self.current_env.observation_spec,
+            "action_spec": self.current_env.action_spec,
+            "full_action_spec_unbatched": self.current_env.full_action_spec_unbatched,
+            "reward_key": self.current_env.reward_key,
+            "done_keys": self.current_env.done_keys,
+        }
+    
+    def close_all(self):
+        """Close all environments in the cache"""
+        for env in self.env_cache.values():
+            if not env.is_closed:
+                env.close()
 
 
 def rendering_callback(env, td):
@@ -149,36 +150,28 @@ def train(cfg: "DictConfig"):  # noqa: F821
     cfg.collector.total_frames = cfg.collector.frames_per_batch * cfg.collector.n_iters
     cfg.buffer.memory_size = cfg.collector.frames_per_batch
 
-    # Create env and env_test
-    base_env = VmasEnv(
-        scenario=cfg.env.scenario_name,
+    # Create dynamic environment manager for training
+    env_manager = DynamicAgentsManager(
+        scenario_name=cfg.env.scenario_name,
         num_envs=cfg.env.vmas_envs,
-        n_agents=cfg.env.get("max_agents", 8),  # Use max agents as the base
-        continuous_actions=True,
+        min_agents=cfg.env.get("min_agents", 4),
+        max_agents=cfg.env.get("max_agents", 8),
         max_steps=cfg.env.max_steps,
         device=cfg.env.device,
         seed=cfg.seed,
-        # Scenario kwargs
+        # Scenario kwargs can be added here
         # **cfg.env.scenario,
     )
-    
-    # Wrap with variable agents handler
-    variable_agents_env = VariableAgentsWrapper(
-        base_env,
-        min_agents=cfg.env.get("min_agents", 4),
-        max_agents=cfg.env.get("max_agents", 8),
-    )
-    
-    env = TransformedEnv(
-        variable_agents_env,
-        RewardSum(in_keys=[variable_agents_env.reward_key], out_keys=[("agents", "episode_reward")]),
-    )
 
-    # For evaluation, we'll use a fixed number of agents
-    base_env_test = VmasEnv(
+    # Start with a random number of agents
+    env = env_manager.random_num_agents()
+
+    # Create evaluation environment with fixed number of agents
+    eval_num_agents = cfg.eval.get("num_agents", 8)
+    env_test = VmasEnv(
         scenario=cfg.env.scenario_name,
         num_envs=cfg.eval.evaluation_episodes,
-        n_agents=cfg.eval.get("num_agents", 8),  # Default to 8 for evaluation
+        n_agents=eval_num_agents,
         continuous_actions=True,
         max_steps=cfg.env.max_steps,
         device=cfg.env.device,
@@ -187,15 +180,17 @@ def train(cfg: "DictConfig"):  # noqa: F821
         # **cfg.env.scenario,
     )
     
-    # Wrap with fixed agents for evaluation
-    env_test = VariableAgentsWrapper(
-        base_env_test,
-        min_agents=cfg.env.get("min_agents", 4),
-        max_agents=cfg.env.get("max_agents", 8),
-        fixed_num_agents=cfg.eval.get("num_agents", 8)  # Fixed number for eval
+    # Apply standard transformations to eval env
+    env_test = TransformedEnv(
+        env_test,
+        RewardSum(in_keys=[env_test.reward_key], out_keys=[("agents", "episode_reward")]),
     )
 
-    print(f"In torchrl, the given env action spec is {env.action_spec}")
+    # Get current env specs
+    env_specs = env_manager.get_specs()
+    
+
+    print(f"In torchrl, the given env spec is {env_specs}")
     
     # GNN POLICY - Modified to handle agent_mask
     gnn_hidden_dim = cfg.model.get("gnn_hidden_dim", 128)
@@ -203,12 +198,12 @@ def train(cfg: "DictConfig"):  # noqa: F821
     k_neighbours = cfg.model.get("k_neighbours", None) # Default to fully connected if not specified
     pos_indices_list = cfg.model.get("pos_indices", [0, 2]) # Default to first 2
     pos_indices = slice(pos_indices_list[0], pos_indices_list[1])
-    
-    # Modify GNN actor to handle agent_mask
+
+    # Create actor network
     actor_net = nn.Sequential(
         GNNActorVariable(
-            n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
-            n_agent_outputs=2 * env.action_spec.shape[-1],
+            n_agent_inputs=env_specs["observation_spec"]["agents", "observation"].shape[-1],
+            n_agent_outputs=2 * env_specs["action_spec"].shape[-1],
             gnn_hidden_dim=gnn_hidden_dim,
             n_gnn_layers=gnn_layers,
             activation_class=nn.Tanh,
@@ -216,34 +211,38 @@ def train(cfg: "DictConfig"):  # noqa: F821
             pos_indices=pos_indices,
             share_params=cfg.model.shared_parameters,
             device=cfg.train.device,
-            # Add agent_mask support in your GNN implementation
         ),
         NormalParamExtractor(),
     )
     
     policy_module = TensorDictModule(
         actor_net,
-        in_keys=[("agents", "observation")], # , ("agents", "agent_mask")
+        in_keys=[("agents", "observation")],
         out_keys=[("agents", "loc"), ("agents", "scale")],
     )
     
-    lowest_action = torch.zeros_like(env.full_action_spec_unbatched[("agents", "action")].space.low, device=cfg.train.device)
+    lowest_action = torch.zeros_like(
+        env_specs["full_action_spec_unbatched"][("agents", "action")].space.low, 
+        device=cfg.train.device
+    )
+
     policy = ProbabilisticActor(
         module=policy_module,
-        spec=env.full_action_spec_unbatched,
+        spec=env_specs["full_action_spec_unbatched"],
         in_keys=[("agents", "loc"), ("agents", "scale")],
-        out_keys=[env.action_key],
+        out_keys=[env_specs["reward_key"].replace("reward", "action")],
         distribution_class=TanhNormal,
         distribution_kwargs={
             "low": lowest_action,
-            "high": env.full_action_spec_unbatched[("agents", "action")].space.high,
+            "high": env_specs["full_action_spec_unbatched"][("agents", "action")].space.high,
         },
         return_log_prob=True,
     )
+    
 
     # Modify GNN critic to handle agent_mask
     critic_module = GNNCriticVariable(
-        n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
+        n_agent_inputs=env_specs["observation_spec"]["agents", "observation"].shape[-1],
         gnn_hidden_dim=gnn_hidden_dim,
         gnn_layers=gnn_layers,
         activation_class=nn.Tanh,
@@ -260,15 +259,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         out_keys=[("agents", "state_value")]
     )
 
-    collector = SyncDataCollector(
-        env,
-        policy,
-        device=cfg.env.device,
-        storing_device=cfg.train.device,
-        frames_per_batch=cfg.collector.frames_per_batch,
-        total_frames=cfg.collector.total_frames,
-        postproc=DoneTransform(reward_key=env.reward_key, done_keys=env.done_keys),
-    )
+    collector = None
 
     replay_buffer = TensorDictReplayBuffer(
         storage=LazyTensorStorage(cfg.buffer.memory_size, device=cfg.train.device),
@@ -284,19 +275,16 @@ def train(cfg: "DictConfig"):  # noqa: F821
         entropy_coef=cfg.loss.entropy_eps,
         normalize_advantage=False,
     )
-    
+
+
     loss_module.set_keys(
-        reward=env.reward_key,
-        action=env.action_key,
+        reward=env_specs["reward_key"],
+        action=env_specs["reward_key"].replace("reward", "action"),
         done=("agents", "done"),
         terminated=("agents", "terminated"),
         value=("agents", "state_value")
-        # Add agent_mask to loss module keys
-        # agent_mask=("agents", "agent_mask"),
     )
 
-    
-    # Custom value estimator that respects agent_mask
     loss_module.make_value_estimator(
         ValueEstimators.GAE, 
         gamma=cfg.loss.gamma, 
@@ -321,28 +309,53 @@ def train(cfg: "DictConfig"):  # noqa: F821
 
     total_time = 0
     total_frames = 0
-    sampling_start = time.time()
-    for i, tensordict_data in enumerate(collector):
-        torchrl_logger.info(f"\nIteration {i} (using {variable_agents_env.current_num_agents} agents for this batch)")
 
+
+    # Main training loop
+    for i in range(cfg.collector.n_iters):
+        # Set a new random number of agents for this iteration
+        if i > 0:  # Skip the first iteration as we already initialized with random agents
+            env = env_manager.random_num_agents()
+        
+        current_num_agents = env_manager.get_current_num_agents()
+        torchrl_logger.info(f"\nIteration {i} (using {current_num_agents} agents)")
+        
+        # Create a new collector for the current environment
+        if collector is not None:
+            collector.shutdown()
+            
+        collector = SyncDataCollector(
+            env,
+            policy,
+            device=cfg.env.device,
+            storing_device=cfg.train.device,
+            frames_per_batch=cfg.collector.frames_per_batch,
+            total_frames=cfg.collector.frames_per_batch,  # Collect only one batch
+            postproc=DoneTransform(reward_key=env_specs["reward_key"], done_keys=env_specs["done_keys"]),
+        )
+        
+        # Collect data
+        sampling_start = time.time()
+        tensordict_data = next(iter(collector))
         sampling_time = time.time() - sampling_start
 
-        print(f'Loss module tensordict data {tensordict_data[("agents","episode_reward")][0,:] }')
-
+        # Process collected data
         with torch.no_grad():
             loss_module.value_estimator(
                 tensordict_data,
                 params=loss_module.critic_network_params,
                 target_params=loss_module.target_critic_network_params,
             )
+            
         current_frames = tensordict_data.numel()
         total_frames += current_frames
         data_view = tensordict_data.reshape(-1)
         replay_buffer.extend(data_view)
 
+        # Training
         training_tds = []
         training_start = time.time()
-        print(f"Currently using {variable_agents_env.current_num_agents} ")
+        
         for _ in range(cfg.train.num_epochs):
             for _ in range(cfg.collector.frames_per_batch // cfg.train.minibatch_size):
                 subdata = replay_buffer.sample()
@@ -365,15 +378,15 @@ def train(cfg: "DictConfig"):  # noqa: F821
                 optim.step()
                 optim.zero_grad()
 
-        collector.update_policy_weights_()
-
         training_time = time.time() - training_start
-
         iteration_time = sampling_time + training_time
         total_time += iteration_time
         training_tds = torch.stack(training_tds)
 
-        # More logs
+        # Update the policy weights in collector
+        collector.update_policy_weights_()
+
+        # Logging
         if cfg.logger.backend:
             log_training(
                 logger,
@@ -388,15 +401,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
                 step=i,
             )
 
-        # Set number of agents for the *next* data collection round
-        num_agents_for_next_round = random.randint(
-            cfg.env.get("min_agents", 4), cfg.env.get("max_agents", 8)
-        )
-        variable_agents_env.set_num_agents(num_agents_for_next_round)
-        torchrl_logger.info(
-            f"End of round {i}: Setting number of agents for next data collection (round {i+1}) to: {num_agents_for_next_round}"
-        )
-
+        # Evaluation
         if (
             cfg.eval.evaluation_episodes > 0
             and i % cfg.eval.evaluation_interval == 0
@@ -408,21 +413,21 @@ def train(cfg: "DictConfig"):  # noqa: F821
                 rollouts = env_test.rollout(
                     max_steps=cfg.env.max_steps,
                     policy=policy,
-                    callback=rendering_callback,
+                    callback=rendering_callback if 'rendering_callback' in globals() else None,
                     auto_cast_to_device=True,
                     break_when_any_done=False,
                 )
 
                 evaluation_time = time.time() - evaluation_start
-
                 log_evaluation(logger, rollouts, env_test, evaluation_time, step=i)
 
         if cfg.logger.backend == "wandb":
             logger.experiment.log({}, commit=True)
-        sampling_start = time.time()
-    collector.shutdown()
-    if not env.is_closed:
-        env.close()
+    
+    # Clean up
+    if collector is not None:
+        collector.shutdown()
+    env_manager.close_all()
     if not env_test.is_closed:
         env_test.close()
 
