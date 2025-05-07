@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import time
-import random  # Added for randomizing agent numbers
+import random
 import hydra
 import torch
+from collections import defaultdict
 
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
@@ -21,9 +22,29 @@ from torchrl.objectives import ClipPPOLoss, ValueEstimators
 from utils.logging import init_logging, log_evaluation, log_training
 from utils.utils import DoneTransform
 from models.gnn_actor_variable import GNNActorVariable
-from models.gnn_critic_variable import GNNCriticVariable
+from models.gnn_critic import GNNCritic
 
-# New class to handle variable number of agents
+class AgentAdaptivePPOLoss(ClipPPOLoss):
+    """
+    A PPO loss module that handles dynamically changing agent counts.
+    This class extends ClipPPOLoss to properly handle tensors with different agent dimensions.
+    """
+    def forward(self, tensordict):
+        # Extract the number of agents in this batch from the tensordict shape
+        # The agent dimension is typically the second dimension in observation tensors
+        agent_dim = tensordict[("agents", "observation")].shape[1]
+        
+        # Reshape policy outputs to match the current batch's agent count
+        with torch.no_grad():
+            # Get fresh policy outputs for the current observations
+            policy_output = self.actor_network(tensordict)
+            
+            # Update the tensordict with these outputs to ensure shape consistency
+            tensordict.update(policy_output)
+        
+        # Now call the parent class's forward method with the updated tensordict
+        return super().forward(tensordict)
+
 class DynamicAgentsManager:
     """
     Manages environments with a dynamically changing number of agents.
@@ -36,7 +57,7 @@ class DynamicAgentsManager:
         min_agents,
         max_agents,
         continuous_actions=True,
-        max_steps=200,
+        max_steps=100,
         device="cpu",
         seed=None,
         **scenario_kwargs
@@ -132,6 +153,39 @@ class DynamicAgentsManager:
                 env.close()
 
 
+class AgentWiseReplayBuffer:
+    """
+    A replay buffer that maintains separate buffers for each agent count.
+    """
+    def __init__(self, memory_size, device="cpu"):
+        self.device = device
+        self.memory_size = memory_size
+        self.buffers = {}  # Dict mapping num_agents -> TensorDictReplayBuffer
+    
+    def get_buffer(self, num_agents):
+        """Get or create a buffer for the given number of agents"""
+        if num_agents not in self.buffers:
+            self.buffers[num_agents] = TensorDictReplayBuffer(
+                storage=LazyTensorStorage(self.memory_size, device=self.device),
+                sampler=SamplerWithoutReplacement(),
+                batch_size=min(self.memory_size // 4, 256)  # Reasonable default
+            )
+        return self.buffers[num_agents]
+    
+    def extend(self, tensordict, num_agents):
+        """Add experiences to the appropriate buffer"""
+        buffer = self.get_buffer(num_agents)
+        buffer.extend(tensordict)
+    
+    def sample(self, num_agents, batch_size):
+        """Sample from the buffer for the given number of agents"""
+        buffer = self.get_buffer(num_agents)
+        if len(buffer) < batch_size:
+            # Not enough samples for this agent count
+            return None
+        return buffer.sample(batch_size)
+
+
 def rendering_callback(env, td):
     env.frames.append(env.render(mode="rgb_array", agent_index_focus=None))
 
@@ -162,10 +216,10 @@ def train(cfg: "DictConfig"):  # noqa: F821
         # Scenario kwargs can be added here
         # **cfg.env.scenario,
     )
-
-    # Start with a random number of agents
-    env = env_manager.random_num_agents()
-
+    
+    # Start with the maximum number of agents to initialize networks with largest size
+    env = env_manager.set_num_agents(cfg.env.get("max_agents", 8))
+    
     # Create evaluation environment with fixed number of agents
     eval_num_agents = cfg.eval.get("num_agents", 8)
     env_test = VmasEnv(
@@ -189,16 +243,13 @@ def train(cfg: "DictConfig"):  # noqa: F821
     # Get current env specs
     env_specs = env_manager.get_specs()
     
-
-    print(f"In torchrl, the given env spec is {env_specs}")
-    
-    # GNN POLICY - Modified to handle agent_mask
+    # GNN POLICY
     gnn_hidden_dim = cfg.model.get("gnn_hidden_dim", 128)
     gnn_layers = cfg.model.get("gnn_layers", 2)
-    k_neighbours = cfg.model.get("k_neighbours", None) # Default to fully connected if not specified
-    pos_indices_list = cfg.model.get("pos_indices", [0, 2]) # Default to first 2
+    k_neighbours = cfg.model.get("k_neighbours", None)
+    pos_indices_list = cfg.model.get("pos_indices", [0, 2])
     pos_indices = slice(pos_indices_list[0], pos_indices_list[1])
-
+    
     # Create actor network
     actor_net = nn.Sequential(
         GNNActorVariable(
@@ -225,12 +276,12 @@ def train(cfg: "DictConfig"):  # noqa: F821
         env_specs["full_action_spec_unbatched"][("agents", "action")].space.low, 
         device=cfg.train.device
     )
-
+    
     policy = ProbabilisticActor(
         module=policy_module,
         spec=env_specs["full_action_spec_unbatched"],
         in_keys=[("agents", "loc"), ("agents", "scale")],
-        out_keys=[env_specs["reward_key"].replace("reward", "action")],
+        out_keys=[("agents","action")],
         distribution_class=TanhNormal,
         distribution_kwargs={
             "low": lowest_action,
@@ -238,10 +289,9 @@ def train(cfg: "DictConfig"):  # noqa: F821
         },
         return_log_prob=True,
     )
-    
 
-    # Modify GNN critic to handle agent_mask
-    critic_module = GNNCriticVariable(
+    # Create critic network
+    critic_module = GNNCritic(
         n_agent_inputs=env_specs["observation_spec"]["agents", "observation"].shape[-1],
         gnn_hidden_dim=gnn_hidden_dim,
         gnn_layers=gnn_layers,
@@ -250,24 +300,24 @@ def train(cfg: "DictConfig"):  # noqa: F821
         pos_indices=pos_indices,
         share_params=cfg.model.shared_parameters,
         device=cfg.train.device,
-        # Add agent_mask support in your GNN implementation
     )
     
     value_module = ValueOperator(
         module=critic_module,
-        in_keys=[("agents", "observation")], # , ("agents", "agent_mask")
+        in_keys=[("agents", "observation")],
         out_keys=[("agents", "state_value")]
     )
 
+    # Initialize the dynamic collector (will be recreated each round)
     collector = None
 
-    replay_buffer = TensorDictReplayBuffer(
-        storage=LazyTensorStorage(cfg.buffer.memory_size, device=cfg.train.device),
-        sampler=SamplerWithoutReplacement(),
-        batch_size=cfg.train.minibatch_size,
+    # Create agent-wise replay buffer
+    replay_buffer = AgentWiseReplayBuffer(
+        memory_size=cfg.buffer.memory_size,
+        device=cfg.train.device
     )
 
-    # Loss
+    # Loss module
     loss_module = ClipPPOLoss(
         actor_network=policy,
         critic_network=value_module,
@@ -275,11 +325,10 @@ def train(cfg: "DictConfig"):  # noqa: F821
         entropy_coef=cfg.loss.entropy_eps,
         normalize_advantage=False,
     )
-
-
+    
     loss_module.set_keys(
         reward=env_specs["reward_key"],
-        action=env_specs["reward_key"].replace("reward", "action"),
+        action=[("agents","action")],
         done=("agents", "done"),
         terminated=("agents", "terminated"),
         value=("agents", "state_value")
@@ -303,21 +352,21 @@ def train(cfg: "DictConfig"):  # noqa: F821
         )
         logger = init_logging(cfg, model_name)
 
-    initial_num_agents = random.randint(
-        cfg.env.get("min_agents", 4), cfg.env.get("max_agents", 8)
-    )
-
     total_time = 0
     total_frames = 0
-
-
+    
+    # Track which agent counts we've seen
+    agent_counts_seen = {}
+    
     # Main training loop
     for i in range(cfg.collector.n_iters):
         # Set a new random number of agents for this iteration
-        if i > 0:  # Skip the first iteration as we already initialized with random agents
+        if i > 0:  # Skip the first iteration as we already initialized with max agents
             env = env_manager.random_num_agents()
         
         current_num_agents = env_manager.get_current_num_agents()
+        agent_counts_seen[current_num_agents] = agent_counts_seen.get(current_num_agents, 0) + 1
+        
         torchrl_logger.info(f"\nIteration {i} (using {current_num_agents} agents)")
         
         # Create a new collector for the current environment
@@ -339,7 +388,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         tensordict_data = next(iter(collector))
         sampling_time = time.time() - sampling_start
 
-        # Process collected data
+        # Process collected data and add to the appropriate buffer
         with torch.no_grad():
             loss_module.value_estimator(
                 tensordict_data,
@@ -350,56 +399,91 @@ def train(cfg: "DictConfig"):  # noqa: F821
         current_frames = tensordict_data.numel()
         total_frames += current_frames
         data_view = tensordict_data.reshape(-1)
-        replay_buffer.extend(data_view)
+        replay_buffer.extend(data_view, current_num_agents)
 
         # Training
         training_tds = []
         training_start = time.time()
-        
+
+        buffer = replay_buffer.get_buffer(current_num_agents)
+
+        # Train only if we have enough samples
+        if len(buffer) < cfg.train.minibatch_size:
+            print(f"Not enough samples for agent count {current_num_agents}. Skipping training.")
+            continue
+
+        # Train on data from the current agent count
         for _ in range(cfg.train.num_epochs):
-            for _ in range(cfg.collector.frames_per_batch // cfg.train.minibatch_size):
-                subdata = replay_buffer.sample()
-                loss_vals = loss_module(subdata)
-                training_tds.append(loss_vals.detach())
+            minibatch_size = min(cfg.train.minibatch_size, len(buffer))
+            if minibatch_size == 0:
+                print(f"Not enough data for agent count {current_num_agents}, skipping training")
+                continue
+                
+            n_batches = min(cfg.collector.frames_per_batch // minibatch_size, 4)  # Limit number of batches
+            
+            for _ in range(n_batches):
+                subdata = replay_buffer.sample(current_num_agents, minibatch_size)
+                if subdata is None:
+                    continue  # Not enough samples
 
-                loss_value = (
-                    loss_vals["loss_objective"]
-                    + loss_vals["loss_critic"]
-                    + loss_vals["loss_entropy"]
+                try:
+                    loss_vals = loss_module(subdata)
+                    training_tds.append(loss_vals.detach())
+
+                    loss_value = (
+                        loss_vals["loss_objective"]
+                        + loss_vals["loss_critic"]
+                        + loss_vals["loss_entropy"]
+                    )
+
+                    loss_value.backward()
+
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        loss_module.parameters(), cfg.train.max_grad_norm
+                    )
+                    training_tds[-1].set("grad_norm", total_norm.mean())
+
+                    optim.step()
+                    optim.zero_grad()
+                except RuntimeError as e:
+                    # Add some debugging info if an error still occurs
+                    print(f"Error in loss calculation: {e}")
+                    print(f"Agent count: {current_num_agents}")
+                    print(f"Batch size: {minibatch_size}")
+                    # Optionally print tensor shapes for debugging
+                    if "subdata" in locals():
+                        print(f"Observation shape: {subdata[('agents', 'observation')].shape}")
+                        if ('agents', 'action') in subdata:
+                            print(f"Action shape: {subdata[('agents', 'action')].shape}")
+
+        # If we trained anything, update policy and log
+        if training_tds:
+            training_time = time.time() - training_start
+            iteration_time = sampling_time + training_time
+            total_time += iteration_time
+            training_tds = torch.stack(training_tds)
+
+            # Update the policy weights in collector
+            collector.update_policy_weights_()
+
+            # Logging
+            if cfg.logger.backend:
+                log_training(
+                    logger,
+                    training_tds,
+                    tensordict_data,
+                    sampling_time,
+                    training_time,
+                    total_time,
+                    i,
+                    current_frames,
+                    total_frames,
+                    step=i,
                 )
-
-                loss_value.backward()
-
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    loss_module.parameters(), cfg.train.max_grad_norm
-                )
-                training_tds[-1].set("grad_norm", total_norm.mean())
-
-                optim.step()
-                optim.zero_grad()
-
-        training_time = time.time() - training_start
-        iteration_time = sampling_time + training_time
-        total_time += iteration_time
-        training_tds = torch.stack(training_tds)
-
-        # Update the policy weights in collector
-        collector.update_policy_weights_()
-
-        # Logging
-        if cfg.logger.backend:
-            log_training(
-                logger,
-                training_tds,
-                tensordict_data,
-                sampling_time,
-                training_time,
-                total_time,
-                i,
-                current_frames,
-                total_frames,
-                step=i,
-            )
+                
+                # Log agent count distribution
+                agent_count_distribution = {f"agent_count_{k}": v / (i+1) for k, v in agent_counts_seen.items()}
+                logger.experiment.log(agent_count_distribution, step=i)
 
         # Evaluation
         if (
@@ -434,3 +518,5 @@ def train(cfg: "DictConfig"):  # noqa: F821
 
 if __name__ == "__main__":
     train()
+
+
