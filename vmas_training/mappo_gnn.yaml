@@ -2,9 +2,10 @@ seed: 0
 
 env:
   max_steps: 200
-  scenario_name: "pursuit_formation_v2"
-  # scenario:
+  scenario_name: "potential_formation"
+  scenario:
   #   n_agents: 8
+    shared_rew: True
   max_agents_train_upper: 8 # Max agents during training episodes
   min_agents_train_lower: 4 # Min agents during training episodes
   max_agents_eval: 10       # Max agents, used for env init and eval

@@ -31,83 +31,102 @@ class VariableAgentsWrapper(TransformedEnv):
         self.min_agents = min_agents
         self.max_agents = max_agents
         self.fixed_num_agents = fixed_num_agents
-        
+        self.current_num_agents = max_agents - 1 # Just for testing purposes
+         
         # Maximum number of agents we'll ever use (for evaluation too)
         self.max_possible_agents = max(max_agents, fixed_num_agents or 0)
         
         # Add agent_mask to the observation space
-        self._update_specs()
+        # self._update_specs()
     
-    def _update_specs(self):
-        # We add an agent_mask field to the observation space
-        self.observation_spec = self.base_env.observation_spec.clone()
-        # Add a boolean mask to indicate which agents are active
-        self.observation_spec.set(
-            ("agents", "agent_mask"), 
-            torch.zeros(
-                (*self.base_env.batch_size, self.max_possible_agents, 1), 
-                dtype=torch.bool, 
-                device=self.base_env.device
-            )
-        )
+    # def _update_specs(self):
+    #     # We add an agent_mask field to the observation space
+    #     self.observation_spec = self.base_env.observation_spec.clone()
+    #     # Add a boolean mask to indicate which agents are active
+    #     self.observation_spec.set(
+    #         ("agents", "agent_mask"), 
+    #         torch.zeros(
+    #             (*self.base_env.batch_size, self.max_possible_agents, 1), 
+    #             dtype=torch.bool, 
+    #             device=self.base_env.device
+    #         )
+    #     )
+
+    def set_num_agents(self, num_agents: int | None):
+        """
+        Sets a fixed number of agents for subsequent environment resets.
+        If num_agents is None, the number of agents will be randomized
+        between self.min_agents and self.max_agents during resets.
+        """
+        self.current_num_agents = num_agents
+        # You could add a log here if desired:
+        if num_agents is not None:
+            print(f"VariableAgentsWrapper: Number of active agents for next episodes set to {num_agents}")
+        else:
+            print(f"VariableAgentsWrapper: Number of active agents for next episodes will be randomized ({self.min_agents}-{self.max_agents})")
     
     def _reset(self, tensordict=None, **kwargs):
         # Reset the underlying environment
         td = self.base_env._reset(tensordict, **kwargs)
         
         # Choose number of active agents for this episode
-        if self.fixed_num_agents is not None:
-            num_active_agents = self.fixed_num_agents
+        if self.fixed_num_agents is None:
+            num_active_agents = self.current_num_agents
         else:
-            num_active_agents = random.randint(self.min_agents, self.max_agents)
-        
+            num_active_agents = self.fixed_num_agents
+            
         # Create a mask for active agents
-        agent_mask = torch.zeros(
+        self.agent_mask = torch.zeros(
             (*self.base_env.batch_size, self.max_possible_agents, 1), 
             dtype=torch.bool, 
             device=self.base_env.device
         )
         
         # Set first num_active_agents to True (active)
-        agent_mask[..., :num_active_agents, :] = True
+        self.agent_mask[..., :num_active_agents, :] = True
+        print(f"For {num_active_agents} active agents, mask is {self.agent_mask}")
         
         # Add the agent mask to the tensordict
-        td.set(("agents", "agent_mask"), agent_mask)
+        # TEMP: NO AGENT MASK PASSED HERE
+        # td.set(("agents", "agent_mask"), agent_mask)
         
         # Zero out observations for inactive agents
         obs = td.get(("agents", "observation"))
-        obs = obs * agent_mask.expand_as(obs[:, :, :1])  # Use broadcasting to mask observations
+        obs = obs * self.agent_mask.expand_as(obs[:, :, :1])  # Use broadcasting to mask observations
         td.set(("agents", "observation"), obs)
+        print(f"In reset after applying mask, td is {td}")
         
         return td
     
     def _step(self, tensordict):
         # Get the agent mask
-        agent_mask = tensordict.get(("agents", "agent_mask"))
-        
+        # agent_mask = tensordict.get(("agents", "agent_mask"))
+        # TEMP
+
         # Mask the actions for inactive agents (set to zero)
         actions = tensordict.get(self.base_env.action_key)
-        masked_actions = actions * agent_mask.expand_as(actions[:, :, :1])
+        masked_actions = actions * self.agent_mask.expand_as(actions[:, :, :1])
         tensordict.set(self.base_env.action_key, masked_actions)
-
-        # TODO: I have to fix the forward() method such that it receives the agent mask
-
-        # TODO: I have to fix the forward() method such that it receives the agent mask
+        print(f"Set actionkeys as {tensordict[self.base_env.action_key][:,:,0]}")
         
         # Forward to the base environment
+        print(f"In step before forward, tensordict is {tensordict}")
         td = self.base_env._step(tensordict)
+        print(f"In step after forward, tensordict is {td}")
         
         # Propagate the mask to the next state
-        td.set(("agents", "agent_mask"), agent_mask)
+        # TEMP NO MASK
+        # td.set(("agents", "agent_mask"), agent_mask)
         
         # Mask observations and rewards for inactive agents
         obs = td.get(("agents", "observation"))
-        obs = obs * agent_mask.expand_as(obs[:, :, :1])
+        obs = obs * self.agent_mask.expand_as(obs[:, :, :1])
         td.set(("agents", "observation"), obs)
         
         rewards = td.get(self.base_env.reward_key)
-        rewards = rewards * agent_mask
+        rewards = rewards * self.agent_mask
         td.set(self.base_env.reward_key, rewards)
+        print(f"Before returning obs and rew, mask is {td}")
         
         return td
 
@@ -116,7 +135,7 @@ def rendering_callback(env, td):
     env.frames.append(env.render(mode="rgb_array", agent_index_focus=None))
 
 
-@hydra.main(version_base="1.1", config_path="", config_name="mappo_pot")
+@hydra.main(version_base="1.1", config_path="", config_name="mappo_gnn")
 def train(cfg: "DictConfig"):  # noqa: F821
     # Device
     cfg.train.device = "cpu" if not torch.cuda.device_count() else "cuda:0"
@@ -140,20 +159,19 @@ def train(cfg: "DictConfig"):  # noqa: F821
         device=cfg.env.device,
         seed=cfg.seed,
         # Scenario kwargs
-        **cfg.env.scenario,
+        # **cfg.env.scenario,
     )
     
     # Wrap with variable agents handler
-    env = VariableAgentsWrapper(
+    variable_agents_env = VariableAgentsWrapper(
         base_env,
         min_agents=cfg.env.get("min_agents", 4),
         max_agents=cfg.env.get("max_agents", 8),
-        fixed_num_agents=None  # Random during training
     )
     
     env = TransformedEnv(
-        env,
-        RewardSum(in_keys=[env.reward_key], out_keys=[("agents", "episode_reward")]),
+        variable_agents_env,
+        RewardSum(in_keys=[variable_agents_env.reward_key], out_keys=[("agents", "episode_reward")]),
     )
 
     # For evaluation, we'll use a fixed number of agents
@@ -166,7 +184,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         device=cfg.env.device,
         seed=cfg.seed,
         # Scenario kwargs
-        **cfg.env.scenario,
+        # **cfg.env.scenario,
     )
     
     # Wrap with fixed agents for evaluation
@@ -205,7 +223,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     
     policy_module = TensorDictModule(
         actor_net,
-        in_keys=[("agents", "observation"), ("agents", "agent_mask")],
+        in_keys=[("agents", "observation")], # , ("agents", "agent_mask")
         out_keys=[("agents", "loc"), ("agents", "scale")],
     )
     
@@ -238,7 +256,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     
     value_module = ValueOperator(
         module=critic_module,
-        in_keys=[("agents", "observation"), ("agents", "agent_mask")],
+        in_keys=[("agents", "observation")], # , ("agents", "agent_mask")
         out_keys=[("agents", "state_value")]
     )
 
@@ -272,9 +290,11 @@ def train(cfg: "DictConfig"):  # noqa: F821
         action=env.action_key,
         done=("agents", "done"),
         terminated=("agents", "terminated"),
+        value=("agents", "state_value")
         # Add agent_mask to loss module keys
-        agent_mask=("agents", "agent_mask"),
+        # agent_mask=("agents", "agent_mask"),
     )
+
     
     # Custom value estimator that respects agent_mask
     loss_module.make_value_estimator(
@@ -295,13 +315,19 @@ def train(cfg: "DictConfig"):  # noqa: F821
         )
         logger = init_logging(cfg, model_name)
 
+    initial_num_agents = random.randint(
+        cfg.env.get("min_agents", 4), cfg.env.get("max_agents", 8)
+    )
+
     total_time = 0
     total_frames = 0
     sampling_start = time.time()
     for i, tensordict_data in enumerate(collector):
-        torchrl_logger.info(f"\nIteration {i}")
+        torchrl_logger.info(f"\nIteration {i} (using {variable_agents_env.current_num_agents} agents for this batch)")
 
         sampling_time = time.time() - sampling_start
+
+        print(f"Loss module tensordict data {tensordict_data[("agents","state_value")][0,:]}")
 
         with torch.no_grad():
             loss_module.value_estimator(
@@ -316,6 +342,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
 
         training_tds = []
         training_start = time.time()
+        print(f"Currently using {variable_agents_env.current_num_agents} ")
         for _ in range(cfg.train.num_epochs):
             for _ in range(cfg.collector.frames_per_batch // cfg.train.minibatch_size):
                 subdata = replay_buffer.sample()
@@ -359,6 +386,16 @@ def train(cfg: "DictConfig"):  # noqa: F821
                 current_frames,
                 total_frames,
                 step=i,
+            )
+
+        # Set number of agents for the *next* data collection round
+        if i < cfg.collector.n_iters - 1:  # Avoid setting after the last iteration
+            num_agents_for_next_round = random.randint(
+                cfg.env.get("min_agents", 4), cfg.env.get("max_agents", 8)
+            )
+            variable_agents_env.set_num_agents(num_agents_for_next_round)
+            torchrl_logger.info(
+                f"End of round {i}: Setting number of agents for next data collection (round {i+1}) to: {num_agents_for_next_round}"
             )
 
         if (

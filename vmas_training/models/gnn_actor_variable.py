@@ -211,7 +211,7 @@ class GNNActorVariable(nn.Module):
         
         return x, edge_index, batch_vector
 
-    def forward(self, agent_observations: torch.Tensor, agent_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, agent_observations: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the GNN actor.
         
@@ -226,13 +226,15 @@ class GNNActorVariable(nn.Module):
         """
         # Ensure input is on the correct device
         obs = agent_observations.to(dtype=torch.float32)
+        # Get batch dimensions
+        batch_size, n_agents, obs_dim = obs.shape
+        agent_mask = torch.any(obs != 0, dim=2)
+        # print(f"In gnn forward, got obs {obs[:,:,0]} and mask {agent_mask}")
         
         # Reshape agent_mask if needed
         if agent_mask.dim() == 3 and agent_mask.size(2) == 1:
             agent_mask = agent_mask.squeeze(-1)
         
-        # Get batch dimensions
-        batch_size, n_agents, obs_dim = obs.shape
         output_dim = self.n_agent_outputs
         
         # Handle empty batch/no agents case
@@ -246,6 +248,7 @@ class GNNActorVariable(nn.Module):
         if total_active_agents == 0:
             return torch.zeros(batch_size, n_agents, output_dim, device=self.device)
         
+        # print(f"Agent mask is currently {agent_mask}")
         # Create a mapping from original agent indices to condensed indices
         condensed_indices = torch.full((batch_size, n_agents), -1, dtype=torch.long, device=self.device)
         current_idx = 0
