@@ -21,7 +21,7 @@ from torchrl.objectives import ClipPPOLoss, ValueEstimators
 from utils.logging import init_logging, log_evaluation, log_training
 from utils.utils import DoneTransform
 from models.gnn_actor_variable import GNNActorVariable
-from models.gnn_critic import GNNCritic
+from models.gnn_critic_variable import GNNCriticVariable
 
 # New class to handle variable number of agents
 class VariableAgentsWrapper(TransformedEnv):
@@ -178,7 +178,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     base_env_test = VmasEnv(
         scenario=cfg.env.scenario_name,
         num_envs=cfg.eval.evaluation_episodes,
-        n_agents=cfg.eval.get("num_agents", 10),  # Default to 10 for evaluation
+        n_agents=cfg.eval.get("num_agents", 8),  # Default to 8 for evaluation
         continuous_actions=True,
         max_steps=cfg.env.max_steps,
         device=cfg.env.device,
@@ -192,7 +192,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         base_env_test,
         min_agents=cfg.env.get("min_agents", 4),
         max_agents=cfg.env.get("max_agents", 8),
-        fixed_num_agents=cfg.eval.get("num_agents", 10)  # Fixed number for eval
+        fixed_num_agents=cfg.eval.get("num_agents", 8)  # Fixed number for eval
     )
 
     print(f"In torchrl, the given env action spec is {env.action_spec}")
@@ -242,7 +242,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     )
 
     # Modify GNN critic to handle agent_mask
-    critic_module = GNNCritic(
+    critic_module = GNNCriticVariable(
         n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
         gnn_hidden_dim=gnn_hidden_dim,
         gnn_layers=gnn_layers,
@@ -327,7 +327,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
 
         sampling_time = time.time() - sampling_start
 
-        print(f"Loss module tensordict data {tensordict_data[("agents","state_value")][0,:]}")
+        print(f'Loss module tensordict data {tensordict_data[("agents","episode_reward")][0,:] }')
 
         with torch.no_grad():
             loss_module.value_estimator(
@@ -389,14 +389,13 @@ def train(cfg: "DictConfig"):  # noqa: F821
             )
 
         # Set number of agents for the *next* data collection round
-        if i < cfg.collector.n_iters - 1:  # Avoid setting after the last iteration
-            num_agents_for_next_round = random.randint(
-                cfg.env.get("min_agents", 4), cfg.env.get("max_agents", 8)
-            )
-            variable_agents_env.set_num_agents(num_agents_for_next_round)
-            torchrl_logger.info(
-                f"End of round {i}: Setting number of agents for next data collection (round {i+1}) to: {num_agents_for_next_round}"
-            )
+        num_agents_for_next_round = random.randint(
+            cfg.env.get("min_agents", 4), cfg.env.get("max_agents", 8)
+        )
+        variable_agents_env.set_num_agents(num_agents_for_next_round)
+        torchrl_logger.info(
+            f"End of round {i}: Setting number of agents for next data collection (round {i+1}) to: {num_agents_for_next_round}"
+        )
 
         if (
             cfg.eval.evaluation_episodes > 0
