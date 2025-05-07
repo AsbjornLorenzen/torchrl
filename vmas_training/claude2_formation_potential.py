@@ -31,19 +31,39 @@ class AgentAdaptivePPOLoss(ClipPPOLoss):
     """
     def forward(self, tensordict):
         # Extract the number of agents in this batch from the tensordict shape
-        # The agent dimension is typically the second dimension in observation tensors
         agent_dim = tensordict[("agents", "observation")].shape[1]
         
-        # Reshape policy outputs to match the current batch's agent count
         with torch.no_grad():
             # Get fresh policy outputs for the current observations
             policy_output = self.actor_network(tensordict)
             
-            # Update the tensordict with these outputs to ensure shape consistency
+            # Also get fresh critic outputs to ensure shape consistency
+            critic_output = self.critic_network(tensordict)
+            
+            # Update the tensordict with both policy and critic outputs
             tensordict.update(policy_output)
+            tensordict.update(critic_output)
+            
+            # If advantage/return values already exist in the tensordict from a previous batch
+            # with different agent count, we need to recompute them
+            if ("agents", "advantage") in tensordict:
+                # Remove existing advantage values to force recomputation
+                tensordict.pop(("agents", "advantage"), None)
+                
+            if ("agents", "value_target") in tensordict:
+                # Remove existing return values to force recomputation
+                tensordict.pop(("agents", "value_target"), None)
+                
+            # Recompute advantage and returns using the value estimator
+            self.value_estimator(
+                tensordict,
+                params=self.critic_network_params,
+                target_params=self.target_critic_network_params,
+            )
         
         # Now call the parent class's forward method with the updated tensordict
         return super().forward(tensordict)
+
 
 class DynamicAgentsManager:
     """
@@ -318,7 +338,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     )
 
     # Loss module
-    loss_module = ClipPPOLoss(
+    loss_module = AgentAdaptivePPOLoss(
         actor_network=policy,
         critic_network=value_module,
         clip_epsilon=cfg.loss.clip_epsilon,
@@ -357,6 +377,9 @@ def train(cfg: "DictConfig"):  # noqa: F821
     
     # Track which agent counts we've seen
     agent_counts_seen = {}
+
+    # Dictionary to store policies for different agent counts
+    agent_policies = {}
     
     # Main training loop
     for i in range(cfg.collector.n_iters):
@@ -369,20 +392,63 @@ def train(cfg: "DictConfig"):  # noqa: F821
         
         torchrl_logger.info(f"\nIteration {i} (using {current_num_agents} agents)")
         
-        # Create a new collector for the current environment
+        # Check if we need to create a policy for this agent count
+        if current_num_agents not in agent_policies:
+            # Create a new policy for this agent count
+            # Get current env specs for the correct dimensions
+            env_specs = env_manager.get_specs()
+            
+            # Create actor network (can reuse the existing one as GNN handles variable counts)
+            # But we need new distribution parameters
+            lowest_action = torch.zeros_like(
+                env_specs["full_action_spec_unbatched"][("agents", "action")].space.low, 
+                device=cfg.train.device
+            )
+            
+            # Create a new policy with correct dimensions
+            new_policy = ProbabilisticActor(
+                module=policy_module,  # Reuse the network module
+                spec=env_specs["full_action_spec_unbatched"],
+                in_keys=[("agents", "loc"), ("agents", "scale")],
+                out_keys=[("agents","action")],
+                distribution_class=TanhNormal,
+                distribution_kwargs={
+                    "low": lowest_action,
+                    "high": env_specs["full_action_spec_unbatched"][("agents", "action")].space.high,
+                },
+                return_log_prob=True,
+            )
+            
+            # If not the first policy, copy weights from the original
+            if agent_policies:
+                # Copy weights from the first policy
+                first_policy = next(iter(agent_policies.values()))
+                for target_param, source_param in zip(
+                    new_policy.parameters(), first_policy.parameters()
+                ):
+                    target_param.data.copy_(source_param.data)
+            
+            agent_policies[current_num_agents] = new_policy
+        
+        # Get the correct policy for the current agent count
+        policy = agent_policies[current_num_agents]
+        
+        # Create a new collector for the current environment with the correct policy
         if collector is not None:
             collector.shutdown()
             
         collector = SyncDataCollector(
             env,
-            policy,
+            policy,  # Use the policy for the current agent count
             device=cfg.env.device,
             storing_device=cfg.train.device,
             frames_per_batch=cfg.collector.frames_per_batch,
-            total_frames=cfg.collector.frames_per_batch,  # Collect only one batch
+            total_frames=cfg.collector.frames_per_batch,
             postproc=DoneTransform(reward_key=env_specs["reward_key"], done_keys=env_specs["done_keys"]),
         )
-        
+
+        loss_module.actor_network = policy 
+
         # Collect data
         sampling_start = time.time()
         tensordict_data = next(iter(collector))
