@@ -303,6 +303,7 @@ class PPOLoss(LossModule):
         reward: NestedKey | List[NestedKey] = "reward"
         done: NestedKey | List[NestedKey] = "done"
         terminated: NestedKey | List[NestedKey] = "terminated"
+        agent_mask: NestedKey | List[NestedKey] = "agent_mask"
 
         def __post_init__(self):
             if self.sample_log_prob is None:

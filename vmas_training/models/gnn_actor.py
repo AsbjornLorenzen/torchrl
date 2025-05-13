@@ -79,12 +79,22 @@ class GNNActor(nn.Module):
         self.gnn_layers = nn.ModuleList()
         input_dim = n_agent_inputs
         for _ in range(n_gnn_layers):
-            # Using GCNConv as an example
+            # Using GCNConv
             self.gnn_layers.append(GCNConv(input_dim, gnn_hidden_dim))
             input_dim = gnn_hidden_dim
 
         # Output MLP head for each agent
-        self.output_mlp = nn.Linear(gnn_hidden_dim, n_agent_outputs)
+        # self.output_mlp = nn.Linear(gnn_hidden_dim, n_agent_outputs)
+        # Define a hidden dimension - adjust as needed based on your model requirements
+        hidden_dim = 128  # This is a placeholder value
+
+        self.output_mlp = nn.Sequential(
+            # First MLP layer
+            nn.Linear(gnn_hidden_dim, hidden_dim),
+            nn.ReLU(),
+            # Second MLP layer
+            nn.Linear(hidden_dim, n_agent_outputs)
+        )
         self.activation = activation_class()
 
     def _build_graph_batch(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
