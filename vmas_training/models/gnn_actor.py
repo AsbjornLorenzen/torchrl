@@ -86,11 +86,14 @@ class GNNActor(nn.Module):
         # Output MLP head for each agent
         # self.output_mlp = nn.Linear(gnn_hidden_dim, n_agent_outputs)
         # Define a hidden dimension - adjust as needed based on your model requirements
-        hidden_dim = 128  # This is a placeholder value
+        hidden_dim = 256  # This is a placeholder value
 
         self.output_mlp = nn.Sequential(
             # First MLP layer
             nn.Linear(gnn_hidden_dim, hidden_dim),
+            nn.ReLU(),
+            # Second MLP layer
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             # Second MLP layer
             nn.Linear(hidden_dim, n_agent_outputs)
