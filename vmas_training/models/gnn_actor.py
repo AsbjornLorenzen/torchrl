@@ -73,7 +73,7 @@ class GNNActor(nn.Module):
         self.n_agent_outputs = n_agent_outputs
         self.k_neighbours = k_neighbours
         self.pos_indices = pos_indices
-        self.device = device # Store device
+        self.device = device if device is not None else torch.device('cpu') # Store device
 
         # Define GNN layers
         self.gnn_layers = nn.ModuleList()
@@ -82,6 +82,7 @@ class GNNActor(nn.Module):
             # Using GCNConv
             self.gnn_layers.append(GCNConv(input_dim, gnn_hidden_dim))
             input_dim = gnn_hidden_dim
+        self.gnn_layers = self.gnn_layers.to(self.device)
 
         # Output MLP head for each agent
         # self.output_mlp = nn.Linear(gnn_hidden_dim, n_agent_outputs)
@@ -97,8 +98,8 @@ class GNNActor(nn.Module):
             nn.ReLU(),
             # Second MLP layer
             nn.Linear(hidden_dim, n_agent_outputs)
-        )
-        self.activation = activation_class()
+        ).to(self.device)
+        self.activation = activation_class().to(self.device)
 
     def _build_graph_batch(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -196,7 +197,7 @@ class GNNActor(nn.Module):
         # Ensure input is on the correct device
         # It's generally better practice for the outer script to manage device placement,
         # but we can ensure it here if needed.
-        obs = agent_observations.to(dtype=torch.float32)
+        obs = agent_observations.to(dtype=torch.float32, device=self.device)
 
         # obs shape: (batch_size, n_agents, obs_dim)
 

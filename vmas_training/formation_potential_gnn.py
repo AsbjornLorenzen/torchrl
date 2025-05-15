@@ -102,18 +102,6 @@ def train(cfg: "DictConfig"):  # noqa: F821
         out_keys=[("agents", "loc"), ("agents", "scale")],
     )
     lowest_action = torch.zeros_like(env.full_action_spec_unbatched[("agents", "action")].space.low, device=cfg.train.device)
-    policy = ProbabilisticActor(
-        module=policy_module,
-        spec=env.full_action_spec_unbatched,
-        in_keys=[("agents", "loc"), ("agents", "scale")],
-        out_keys=[env.action_key],
-        distribution_class=TanhNormal,
-        distribution_kwargs={
-            "low": lowest_action,
-            "high": env.full_action_spec_unbatched[("agents", "action")].space.high,
-        },
-        return_log_prob=True,
-    )
 
     policy = ProbabilisticActor(
         module=policy_module,
@@ -149,6 +137,8 @@ def train(cfg: "DictConfig"):  # noqa: F821
         policy,
         device=cfg.env.device,
         storing_device=cfg.train.device,
+        policy_device=cfg.env.device,
+        env_device=cfg.env.device,
         frames_per_batch=cfg.collector.frames_per_batch,
         total_frames=cfg.collector.total_frames,
         postproc=DoneTransform(reward_key=env.reward_key, done_keys=env.done_keys),
