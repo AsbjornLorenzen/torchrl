@@ -40,10 +40,14 @@ train:
   device: ???
 
 eval:
-  evaluation_interval: 20
+  evaluation_interval: 1
   evaluation_episodes: 200
 
 logger:
   backend: wandb # Delete to remove logging
   project_name: null
   group_name: null
+
+snapshots:
+  save_dir: saves
+  save_best_only: False

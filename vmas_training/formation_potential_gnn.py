@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import time
-
+import os
 import hydra
 import torch
 
@@ -32,6 +32,47 @@ from models.gnn_critic import GNNCritic
 def rendering_callback(env, td):
     env.frames.append(env.render(mode="rgb_array", agent_index_focus=None))
 
+def save_model_snapshot(policy, value_module, iteration, metrics=None):
+    """
+    Save a snapshot of the model parameters.
+    
+    Args:
+        policy: The policy network
+        value_module: The value network
+        save_dir: Directory to save the snapshot
+        iteration: Current training iteration
+        metrics: Optional evaluation metrics to include in the filename
+    """
+    current_dir = os.getcwd()
+    save_dir = os.path.join(current_dir, 'snapshots')
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Create a checkpoint dictionary with both policy and value module states
+    checkpoint = {
+        'policy_state_dict': policy.state_dict(),
+        'value_state_dict': value_module.state_dict(),
+        'iteration': iteration,
+    }
+    
+    # Add metrics if provided
+    if metrics is not None:
+        checkpoint['metrics'] = metrics
+    
+    # Generate filename with metrics if available
+    if metrics is not None and 'mean_reward' in metrics:
+        mean_reward = metrics['mean_reward']
+        filename = f"model_snapshot_iter_{iteration}_reward_{mean_reward:.2f}.pt"
+    else:
+        filename = f"model_snapshot_iter_{iteration}.pt"
+    
+    # Save the model
+    save_path = os.path.join(save_dir, filename)
+    torch.save(checkpoint, save_path)
+    
+    torchrl_logger.info(f"Model snapshot saved to {save_path}")
+    
+    return save_path
 
 @hydra.main(version_base="1.1", config_path="", config_name="mappo_gnn")
 def train(cfg: "DictConfig"):  # noqa: F821
@@ -46,6 +87,10 @@ def train(cfg: "DictConfig"):  # noqa: F821
     cfg.env.vmas_envs = cfg.collector.frames_per_batch // cfg.env.max_steps
     cfg.collector.total_frames = cfg.collector.frames_per_batch * cfg.collector.n_iters
     cfg.buffer.memory_size = cfg.collector.frames_per_batch
+
+    cfg.snapshots = cfg.get("snapshots", {})
+    cfg.snapshots.save_dir = cfg.snapshots.get("save_dir", "model_snapshots")
+    cfg.snapshots.save_best_only = cfg.snapshots.get("save_best_only", False)
 
     # Create env and env_test
     env = VmasEnv(
@@ -182,6 +227,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     total_time = 0
     total_frames = 0
     sampling_start = time.time()
+    best_mean_reward = float('-inf')
     for i, tensordict_data in enumerate(collector):
         torchrl_logger.info(f"\nIteration {i}")
 
@@ -264,7 +310,39 @@ def train(cfg: "DictConfig"):  # noqa: F821
 
                 evaluation_time = time.time() - evaluation_start
 
-                log_evaluation(logger, rollouts, env_test, evaluation_time, step=i)
+                eval_metrics = log_evaluation(logger, rollouts, env_test, evaluation_time, step=i)
+
+                # SAVE SNAPSHOT 
+                # Extract mean reward for model saving decision
+                # Assuming log_evaluation returns or modifies eval_metrics with this info
+                # If not, you'll need to calculate it here from rollouts
+                mean_reward = eval_metrics.get('mean_reward', 
+                                               rollouts.get(('agents', 'episode_reward'), None))
+                
+                if isinstance(mean_reward, torch.Tensor):
+                    mean_reward = mean_reward.mean().item()
+                
+                # Save model snapshot
+                metrics = {'mean_reward': mean_reward} if mean_reward is not None else None
+                
+                # Decide whether to save based on save_best_only flag
+                should_save = True
+                if cfg.snapshots.save_best_only and mean_reward is not None:
+                    if mean_reward > best_mean_reward:
+                        best_mean_reward = mean_reward
+                        torchrl_logger.info(f"New best mean reward: {best_mean_reward:.4f}")
+                    else:
+                        should_save = False
+                
+                if should_save:
+                    save_model_snapshot(
+                        policy=policy,
+                        value_module=value_module,
+                        save_dir=cfg.snapshots.save_dir,
+                        iteration=i,
+                        metrics=metrics
+                    )
+
 
         if cfg.logger.backend == "wandb":
             logger.experiment.log({}, commit=True)
