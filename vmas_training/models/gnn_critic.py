@@ -72,7 +72,7 @@ class GNNCritic(nn.Module):
         self.n_agent_inputs = n_agent_inputs
         self.k_neighbours = k_neighbours
         self.pos_indices = pos_indices
-        self.device = device
+        self.device = device if device is not None else torch.device('cpu')
 
         # Define GNN layers
         self.gnn_layers = nn.ModuleList()
@@ -88,10 +88,11 @@ class GNNCritic(nn.Module):
                 )
             )
             input_dim = gnn_hidden_dim
+        self.gnn_layers = self.gnn_layers.to(self.device)
 
         # Output MLP head for each agent's value estimate
-        self.output_mlp = nn.Linear(gnn_hidden_dim, 1)
-        self.activation = activation_class()
+        self.output_mlp = nn.Linear(gnn_hidden_dim, 1).to(self.device)
+        self.activation = activation_class().to(self.device)
 
     def _build_graph_batch(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
