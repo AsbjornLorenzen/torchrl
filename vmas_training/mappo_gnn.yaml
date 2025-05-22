@@ -5,7 +5,7 @@ env:
   max_steps: 300
   scenario_name: "eval_potential_formation_img"
   scenario:
-    n_agents: 6
+    n_agents: 16
     shared_rew: True
   device: ??? # These values will be populated dynamically
   vmas_envs: ???
