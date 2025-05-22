@@ -1,23 +1,27 @@
 seed: 0
-model_dir: "/Users/asbjornlorenzen/Documents/code/diss-playground/torchrl/outputs/2025-05-21/11-24-31/snapshots"
 
 env:
   max_steps: 300
-  scenario_name: "eval_potential_formation_img"
+  scenario_name: "potential_formation_img"
   scenario:
-    n_agents: 6
+    n_agents: 8
     shared_rew: True
   device: ??? # These values will be populated dynamically
   vmas_envs: ???
 
 model:
+  pgat_hidden_dim: 128
+  pgat_layers: 2
+  k_agents: 2  # Number of agents in observation space
+  k_obstacles: 2  # Number of obstacles in observation space
+  agent_feature_dim: 6  # Dimension of each agent's features
+  obstacle_feature_dim: 4  # Dimension of each obstacle's features
+  agent_attenuation: 1.0
+  obstacle_attenuation: 1.0
   shared_parameters: True
   centralised_critic: True  # MAPPO if True, IPPO if False
-  gnn_hidden_dim: 128
-  gnn_layers: 2
   k_neighbours: 2
   pos_indices: [0, 2]
-
 
 collector:
   frames_per_batch: 6_000 # Frames sampled each sampling iteration
@@ -43,7 +47,6 @@ train:
 eval:
   evaluation_interval: 10
   evaluation_episodes: 200
-  render: True
 
 logger:
   backend: wandb # Delete to remove logging
@@ -53,3 +56,4 @@ logger:
 snapshots:
   save_dir: saves
   save_best_only: False
+

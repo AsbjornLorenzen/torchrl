@@ -33,7 +33,7 @@ def load_model(model_path, model):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found at: {model_path}")
     
-    state_dict = torch.load(model_path, map_location='cpu')
+    state_dict = torch.load(model_path, map_location='cpu')['policy_state_dict']
     model.load_state_dict(state_dict)
     print(f"Successfully loaded model from {model_path}")
     return model
@@ -135,11 +135,12 @@ def evaluate(cfg: DictConfig):
 
     # Load pre-trained model parameters
     if cfg.model_dir:
-        actor_path = os.path.join(cfg.model_dir, "actor.pth")
+        actor_path = os.path.join(cfg.model_dir, "model_snapshot_iter_260.pt")
         critic_path = os.path.join(cfg.model_dir, "critic.pth")
         
         if os.path.exists(actor_path):
             policy = load_model(actor_path, policy)
+            print(f"Loaded actor model at {actor_path}")
         else:
             print(f"Warning: Actor model not found at {actor_path}")
             

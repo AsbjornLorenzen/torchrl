@@ -25,7 +25,7 @@ from torchrl.modules.models.multiagent import MultiAgentMLP
 from torchrl.objectives import ClipPPOLoss, ValueEstimators
 from utils.logging import init_logging, log_evaluation, log_training
 from utils.utils import DoneTransform
-from models.gnn_actor import GNNActor
+from models.gat_actor import PGATActor
 from models.gnn_critic import GNNCritic
 
 
@@ -119,26 +119,40 @@ def train(cfg: "DictConfig"):  # noqa: F821
         **cfg.env.scenario,
     )
 
-
     print(f"In torchrl, the given env action spec is {env.action_spec}")
     # GNN POLICY
-    gnn_hidden_dim = cfg.model.get("gnn_hidden_dim", 128)
-    gnn_layers = cfg.model.get("gnn_layers", 2)
-    k_neighbours = cfg.model.get("k_neighbours", None) # Default to fully connected if not specified
     pos_indices_list = cfg.model.get("pos_indices", [0, 2]) # Default to first 2
     pos_indices = slice(pos_indices_list[0], pos_indices_list[1])
+
+    pgat_hidden_dim = cfg.model.get("pgat_hidden_dim", 128)
+    pgat_layers = cfg.model.get("pgat_layers", 2)
+    k_agents = cfg.model.get("k_agents", 5)
+    k_obstacles = cfg.model.get("k_obstacles", 5)
+    agent_feature_dim = cfg.model.get("agent_feature_dim", 6)  # Example size
+    obstacle_feature_dim = cfg.model.get("obstacle_feature_dim", 4)  # Example size
+    agent_attenuation = cfg.model.get("agent_attenuation", 1.0)
+    obstacle_attenuation = cfg.model.get("obstacle_attenuation", 1.0)
+    neighbor_pos_indices = [10, 10 + (k_agents * 2)]
+    obstacle_pos_indices = [neighbor_pos_indices[1], neighbor_pos_indices[1] + (k_obstacles * 2)]
+
+    actor_pgat_module = PGATActor(
+        obs_dim=env.observation_spec["agents", "observation"].shape[-1],
+        agent_feature_dim=agent_feature_dim,
+        obstacle_feature_dim=obstacle_feature_dim,
+        n_agent_outputs=2 * env.action_spec.shape[-1],  # For loc and scale
+        hidden_dim=pgat_hidden_dim,
+        n_gat_layers=pgat_layers,
+        k_agents=k_agents,
+        k_obstacles=k_obstacles,
+        agent_pos_indices=neighbor_pos_indices,
+        obstacle_pos_indices=obstacle_pos_indices,  # Same as agent positions for simplicity
+        agent_attenuation=agent_attenuation,
+        obstacle_attenuation=obstacle_attenuation,
+        device=cfg.train.device
+    )
+
     actor_net = nn.Sequential(
-        GNNActor(
-            n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
-            n_agent_outputs=2 * env.action_spec.shape[-1],
-            gnn_hidden_dim=gnn_hidden_dim,
-            n_gnn_layers=gnn_layers,
-            activation_class=nn.Tanh,
-            k_neighbours=k_neighbours,
-            pos_indices=pos_indices,
-            share_params=cfg.model.shared_parameters,
-            device=cfg.train.device,
-        ),
+        actor_pgat_module,
         NormalParamExtractor(),
     )
     policy_module = TensorDictModule(
