@@ -5,7 +5,7 @@ env:
   max_steps: 300
   scenario_name: "eval_potential_formation_img"
   scenario:
-    n_agents: 16
+    n_agents: 9
     shared_rew: True
   device: ??? # These values will be populated dynamically
   vmas_envs: ???
@@ -42,7 +42,7 @@ train:
 
 eval:
   evaluation_interval: 10
-  evaluation_episodes: 200
+  evaluation_episodes: 20
   render: True
 
 logger:

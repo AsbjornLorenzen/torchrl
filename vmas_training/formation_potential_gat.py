@@ -135,17 +135,23 @@ def train(cfg: "DictConfig"):  # noqa: F821
     neighbor_pos_indices = [10, 10 + (k_agents * 2)]
     obstacle_pos_indices = [neighbor_pos_indices[1], neighbor_pos_indices[1] + (k_obstacles * 2)]
 
+
+    pgat_hidden_dim = cfg.model.get("pgat_hidden_dim", 128)
+    pgat_layers = cfg.model.get("pgat_layers", 2)
+    k_agents = cfg.model.get("k_agents", 5)
+    k_obstacles = cfg.model.get("k_obstacles", 5)
+    agent_attenuation = cfg.model.get("agent_attenuation", 1.0)
+    obstacle_attenuation = cfg.model.get("obstacle_attenuation", 1.0)
+
     actor_pgat_module = PGATActor(
-        obs_dim=env.observation_spec["agents", "observation"].shape[-1],
-        agent_feature_dim=agent_feature_dim,
-        obstacle_feature_dim=obstacle_feature_dim,
+        n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
         n_agent_outputs=2 * env.action_spec.shape[-1],  # For loc and scale
-        hidden_dim=pgat_hidden_dim,
-        n_gat_layers=pgat_layers,
+        n_agents=env.n_agents,
+        gnn_hidden_dim=pgat_hidden_dim,
+        n_gnn_layers=pgat_layers,
+        activation_class=nn.Tanh,
         k_agents=k_agents,
         k_obstacles=k_obstacles,
-        agent_pos_indices=neighbor_pos_indices,
-        obstacle_pos_indices=obstacle_pos_indices,  # Same as agent positions for simplicity
         agent_attenuation=agent_attenuation,
         obstacle_attenuation=obstacle_attenuation,
         device=cfg.train.device

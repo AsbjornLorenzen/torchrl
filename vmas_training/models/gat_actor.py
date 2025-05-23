@@ -39,8 +39,6 @@ class PGATActor(nn.Module):
         activation_class=nn.Tanh,
         k_agents: int = 5,  # Number of agent neighbors in observation
         k_obstacles: int = 5,  # Number of obstacles in observation
-        agent_pos_indices: slice = slice(0, 2),  # Position indices in agent features
-        obstacle_pos_indices: slice = slice(0, 2),  # Position indices in obstacle features
         agent_attenuation: float = 1.0,  # c_a^W in the paper
         obstacle_attenuation: float = 1.0,  # c_o^W in the paper
         device=None,
@@ -51,8 +49,6 @@ class PGATActor(nn.Module):
         self.n_agents = n_agents
         self.k_agents = k_agents
         self.k_obstacles = k_obstacles
-        self.agent_pos_indices = agent_pos_indices
-        self.obstacle_pos_indices = obstacle_pos_indices
         self.agent_attenuation = agent_attenuation
         self.obstacle_attenuation = obstacle_attenuation
         self.device = device if device is not None else torch.device('cpu')

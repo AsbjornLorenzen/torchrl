@@ -22,6 +22,8 @@ model:
   centralised_critic: True  # MAPPO if True, IPPO if False
   k_neighbours: 2
   pos_indices: [0, 2]
+  gnn_hidden_dim: 128
+  gnn_layers: 2
 
 collector:
   frames_per_batch: 6_000 # Frames sampled each sampling iteration

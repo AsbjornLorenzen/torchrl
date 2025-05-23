@@ -135,7 +135,7 @@ def evaluate(cfg: DictConfig):
 
     # Load pre-trained model parameters
     if cfg.model_dir:
-        actor_path = os.path.join(cfg.model_dir, "model_snapshot_iter_260.pt")
+        actor_path = os.path.join(cfg.model_dir, "model_snapshot_iter_230.pt")
         critic_path = os.path.join(cfg.model_dir, "critic.pth")
         
         if os.path.exists(actor_path):
