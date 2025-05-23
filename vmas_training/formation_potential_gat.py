@@ -74,7 +74,7 @@ def save_model_snapshot(policy, value_module, iteration, metrics=None):
     
     return save_path
 
-@hydra.main(version_base="1.1", config_path="", config_name="mappo_gnn")
+@hydra.main(version_base="1.1", config_path="", config_name="mappo_gat")
 def train(cfg: "DictConfig"):  # noqa: F821
     # Device
     cfg.train.device = "cpu" if not torch.cuda.device_count() else "cuda:0"
@@ -119,48 +119,48 @@ def train(cfg: "DictConfig"):  # noqa: F821
         **cfg.env.scenario,
     )
 
-    print(f"In torchrl, the given env action spec is {env.action_spec}")
-    # GNN POLICY
-    pos_indices_list = cfg.model.get("pos_indices", [0, 2]) # Default to first 2
-    pos_indices = slice(pos_indices_list[0], pos_indices_list[1])
+    gnn_hidden_dim = cfg.model.get("gnn_hidden_dim", 128)
+    gnn_layers = cfg.model.get("gnn_layers", 2)
+    n_attention_heads = cfg.model.get("n_attention_heads", 4)  # New parameter for GAT
+    dropout = cfg.model.get("dropout", 0.0)  # Optional dropout for attention
+    k_neighbors = cfg.model.get("k_neighbors", None)
+    k_obstacles = cfg.model.get("k_obstacles", None)
 
-    pgat_hidden_dim = cfg.model.get("pgat_hidden_dim", 128)
-    pgat_layers = cfg.model.get("pgat_layers", 2)
-    k_agents = cfg.model.get("k_agents", 5)
-    k_obstacles = cfg.model.get("k_obstacles", 5)
-    agent_feature_dim = cfg.model.get("agent_feature_dim", 6)  # Example size
-    obstacle_feature_dim = cfg.model.get("obstacle_feature_dim", 4)  # Example size
-    agent_attenuation = cfg.model.get("agent_attenuation", 1.0)
-    obstacle_attenuation = cfg.model.get("obstacle_attenuation", 1.0)
-    neighbor_pos_indices = [10, 10 + (k_agents * 2)]
-    obstacle_pos_indices = [neighbor_pos_indices[1], neighbor_pos_indices[1] + (k_obstacles * 2)]
+    # Position indices configuration
+    agent_pos_indices_list = cfg.model.get("agent_pos_indices", [0, 2])
+    agent_pos_indices = slice(agent_pos_indices_list[0], agent_pos_indices_list[1])
+
+    neighbor_pos_indices_list = [10, 10 + (k_neighbors * 2)]
+    neighbor_pos_indices = slice(neighbor_pos_indices_list[0], neighbor_pos_indices_list[1])
+    obstacle_pos_indices_list = [neighbor_pos_indices_list[1], neighbor_pos_indices_list[1] + (k_obstacles * 2)]
+    obstacle_pos_indices = slice(obstacle_pos_indices_list[0], obstacle_pos_indices_list[1])
 
 
-    pgat_hidden_dim = cfg.model.get("pgat_hidden_dim", 128)
-    pgat_layers = cfg.model.get("pgat_layers", 2)
-    k_agents = cfg.model.get("k_agents", 5)
-    k_obstacles = cfg.model.get("k_obstacles", 5)
-    agent_attenuation = cfg.model.get("agent_attenuation", 1.0)
-    obstacle_attenuation = cfg.model.get("obstacle_attenuation", 1.0)
+    # Number of neighbors and obstacles
+    k_neighbours = cfg.model.get("k_neighbours", None)
+    k_obstacles = cfg.model.get("k_obstacles", None)
 
-    actor_pgat_module = PGATActor(
-        n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
-        n_agent_outputs=2 * env.action_spec.shape[-1],  # For loc and scale
-        n_agents=env.n_agents,
-        gnn_hidden_dim=pgat_hidden_dim,
-        n_gnn_layers=pgat_layers,
-        activation_class=nn.Tanh,
-        k_agents=k_agents,
-        k_obstacles=k_obstacles,
-        agent_attenuation=agent_attenuation,
-        obstacle_attenuation=obstacle_attenuation,
-        device=cfg.train.device
-    )
-
+    # Create the PGATActor
     actor_net = nn.Sequential(
-        actor_pgat_module,
+        PGATActor(
+            n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
+            n_agent_outputs=2 * env.action_spec.shape[-1],
+            gnn_hidden_dim=gnn_hidden_dim,
+            n_gnn_layers=gnn_layers,
+            n_attention_heads=n_attention_heads,
+            activation_class=nn.Tanh,
+            k_neighbours=k_neighbours,
+            k_obstacles=k_obstacles,
+            agent_pos_indices=agent_pos_indices,
+            neighbor_agent_pos_indices=neighbor_pos_indices,
+            obstacle_pos_indices=obstacle_pos_indices,
+            share_params=cfg.model.shared_parameters,
+            dropout=dropout,
+            device=cfg.train.device,
+        ),
         NormalParamExtractor(),
     )
+
     policy_module = TensorDictModule(
         actor_net,
         in_keys=[("agents", "observation")],
@@ -187,7 +187,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         gnn_layers=gnn_layers,
         activation_class=nn.Tanh,
         k_neighbours=None,
-        pos_indices=pos_indices,
+        pos_indices=agent_pos_indices,
         share_params=cfg.model.shared_parameters, # Kept for consistency, GNN shares anyway
         device=cfg.train.device, # Pass device object
     )

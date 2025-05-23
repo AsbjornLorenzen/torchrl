@@ -10,20 +10,15 @@ env:
   vmas_envs: ???
 
 model:
-  pgat_hidden_dim: 128
-  pgat_layers: 2
-  k_agents: 2  # Number of agents in observation space
-  k_obstacles: 2  # Number of obstacles in observation space
-  agent_feature_dim: 6  # Dimension of each agent's features
-  obstacle_feature_dim: 4  # Dimension of each obstacle's features
-  agent_attenuation: 1.0
-  obstacle_attenuation: 1.0
-  shared_parameters: True
-  centralised_critic: True  # MAPPO if True, IPPO if False
-  k_neighbours: 2
-  pos_indices: [0, 2]
   gnn_hidden_dim: 128
   gnn_layers: 2
+  k_neighbors: 2  # Number of agents in observation space
+  k_obstacles: 2  # Number of obstacles in observation space
+  n_attention_heads: 4
+  dropout: 0.0
+  agent_pos_indices: [0,2]
+  shared_parameters: True
+  centralised_critic: True  # MAPPO if True, IPPO if False
 
 collector:
   frames_per_batch: 6_000 # Frames sampled each sampling iteration
