@@ -110,15 +110,15 @@ class PGATCrossAttentionLayer(nn.Module):
         self.c_obstacle_decay = nn.Parameter(torch.tensor(c_obstacle_decay, device=self.device).clamp(min=0.1))
         
         # Linear transformations for Query
-        self.lin_query = nn.Linear(query_dim, heads * out_channels, bias=False, device=self.device)
+        self.lin_query = nn.Linear(query_dim, heads * out_channels, bias=True, device=self.device)
         
         # Separate linear transformations for agent neighbors
-        self.lin_agent_key = nn.Linear(agent_key_dim, heads * out_channels, bias=False, device=self.device)
-        self.lin_agent_value = nn.Linear(agent_value_dim, heads * out_channels, bias=False, device=self.device)
+        self.lin_agent_key = nn.Linear(agent_key_dim, heads * out_channels, bias=True, device=self.device)
+        self.lin_agent_value = nn.Linear(agent_value_dim, heads * out_channels, bias=True, device=self.device)
         
         # Separate linear transformations for obstacles  
-        self.lin_obstacle_key = nn.Linear(obstacle_key_dim, heads * out_channels, bias=False, device=self.device)
-        self.lin_obstacle_value = nn.Linear(obstacle_value_dim, heads * out_channels, bias=False, device=self.device)
+        self.lin_obstacle_key = nn.Linear(obstacle_key_dim, heads * out_channels, bias=True, device=self.device)
+        self.lin_obstacle_value = nn.Linear(obstacle_value_dim, heads * out_channels, bias=True, device=self.device)
         
         # Output projection networks for concatenated features
         self.agent_proj = nn.Linear(heads * out_channels, out_channels, device=self.device)
@@ -197,7 +197,7 @@ class PGATCrossAttentionLayer(nn.Module):
         )  # [n_agents, k_neighbors, 1]
         
         # Distance-based weights: exp(-c * distance)
-        distance_weights = torch.exp(-self.c_agent_decay * distances)  # [n_agents, k_neighbors, 1]
+        distance_weights = torch.exp(-self.c_agent_decay * distances) + 1e-8 # [n_agents, k_neighbors, 1]
         
         # Dot-product attention
         # query: [n_agents, H, C], agent_keys: [n_agents, k_neighbors, H, C]
@@ -259,7 +259,7 @@ class PGATCrossAttentionLayer(nn.Module):
 
         return self.obstacle_proj(attended)
 
-class MultiLayerEnhancedPGATActor(nn.Module):
+class PGATActor(nn.Module):
     def __init__(
         self,
         obs_config: ObservationConfig,
@@ -268,7 +268,7 @@ class MultiLayerEnhancedPGATActor(nn.Module):
         gnn_hidden_dim: int = 128,
         n_gnn_layers: int = 2,
         n_attention_heads: int = 4,
-        k_neighbours: Optional[int] = None,
+        k_neighbors: Optional[int] = None,
         k_obstacles: Optional[int] = None,
         dropout: float = 0.0,
         pos_indices: slice = slice(0, 2),
@@ -279,7 +279,7 @@ class MultiLayerEnhancedPGATActor(nn.Module):
         self.obs_config = obs_config
         self.total_obs_dim = total_obs_dim
         self.n_agent_outputs = n_agent_outputs
-        self.k_neighbours = k_neighbours or obs_config.k_neighbors
+        self.k_neighbors = k_neighbors or obs_config.k_neighbors
         self.k_obstacles = k_obstacles or obs_config.k_obstacles
         self.pos_indices = pos_indices
         self.device = device if device is not None else torch.device('cpu')
@@ -368,8 +368,8 @@ class MultiLayerEnhancedPGATActor(nn.Module):
         obstacle_values_raw = self._extract_features_from_obs(obs, self.obs_config.get_obstacle_value_indices())
         
         # Reshape to separate individual neighbors/obstacles
-        agent_key_features = neighbor_keys_raw.view(batch_size, self.k_neighbours, -1)
-        agent_value_features = neighbor_values_raw.view(batch_size, self.k_neighbours, -1)
+        agent_key_features = neighbor_keys_raw.view(batch_size, self.k_neighbors, -1)
+        agent_value_features = neighbor_values_raw.view(batch_size, self.k_neighbors, -1)
         obstacle_key_features = obstacle_keys_raw.view(batch_size, self.k_obstacles, -1) 
         obstacle_value_features = obstacle_values_raw.view(batch_size, self.k_obstacles, -1)
         
@@ -384,7 +384,7 @@ class MultiLayerEnhancedPGATActor(nn.Module):
         
         # Extract neighbor positions from the neighbor block
         neighbor_block = obs[:, self.obs_config.neighbor_block_idx]  
-        neighbor_block = neighbor_block.view(batch_size, self.k_neighbours, self.obs_config.neighbor_obs_dim)  
+        neighbor_block = neighbor_block.view(batch_size, self.k_neighbors, self.obs_config.neighbor_obs_dim)  
         neighbor_positions = neighbor_block[:, :, :2]  # Assuming first 2 are positions
         
         # Extract obstacle positions
@@ -436,7 +436,7 @@ class MultiLayerEnhancedPGATActor(nn.Module):
             else:
                 # Subsequent layers: project previous embeddings
                 # Project agent embeddings to neighbor/obstacle spaces
-                neighbor_embeddings = self.neighbor_projections[i-1](x).unsqueeze(1).expand(-1, self.k_neighbours, -1)
+                neighbor_embeddings = self.neighbor_projections[i-1](x).unsqueeze(1).expand(-1, self.k_neighbors, -1)
                 obstacle_embeddings = self.obstacle_projections[i-1](x).unsqueeze(1).expand(-1, self.k_obstacles, -1)
                 
                 x = layer(

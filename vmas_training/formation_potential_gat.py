@@ -8,7 +8,7 @@ import time
 import os
 import hydra
 import torch
-import datetime
+from datetime import datetime
 
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
@@ -26,7 +26,7 @@ from torchrl.modules.models.multiagent import MultiAgentMLP
 from torchrl.objectives import ClipPPOLoss, ValueEstimators
 from utils.logging import init_logging, log_evaluation, log_training
 from utils.utils import DoneTransform
-from models.gat_actor import PGATActor
+from models.gat_actor import PGATActor, ObservationConfig
 from models.gnn_critic import GNNCritic
 
 
@@ -185,39 +185,27 @@ def train(cfg: "DictConfig"):  # noqa: F821
     gnn_layers = cfg.model.get("gnn_layers", 2)
     n_attention_heads = cfg.model.get("n_attention_heads", 4)  # New parameter for GAT
     dropout = cfg.model.get("dropout", 0.0)  # Optional dropout for attention
-    k_neighbors = cfg.model.get("k_neighbors", None)
-    k_obstacles = cfg.model.get("k_obstacles", None)
+    k_neighbors = cfg.model.get("k_neighbors", 2)
+    k_obstacles = cfg.model.get("k_obstacles", 2)
 
     # Position indices configuration
     agent_pos_indices_list = cfg.model.get("agent_pos_indices", [0, 2])
     agent_pos_indices = slice(agent_pos_indices_list[0], agent_pos_indices_list[1])
 
-    neighbor_pos_indices_list = [12, 12 + (k_neighbors * 2)]
-    neighbor_pos_indices = slice(neighbor_pos_indices_list[0], neighbor_pos_indices_list[1])
-    obstacle_pos_indices_list = [neighbor_pos_indices_list[1], neighbor_pos_indices_list[1] + (k_obstacles * 2)]
-    obstacle_pos_indices = slice(obstacle_pos_indices_list[0], obstacle_pos_indices_list[1])
-
-
-    # Number of neighbors and obstacles
-    k_neighbours = cfg.model.get("k_neighbours", None)
-    k_obstacles = cfg.model.get("k_obstacles", None)
-
+    observation_config = ObservationConfig(k_neighbors=k_neighbors, k_obstacles=k_obstacles)
     # Create the PGATActor
     actor_net = nn.Sequential(
         PGATActor(
-            n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
+            obs_config=observation_config,
+            total_obs_dim=env.observation_spec["agents", "observation"].shape[-1],
             n_agent_outputs=2 * env.action_spec.shape[-1],
             gnn_hidden_dim=gnn_hidden_dim,
             n_gnn_layers=gnn_layers,
             n_attention_heads=n_attention_heads,
-            activation_class=nn.Tanh,
-            k_neighbours=k_neighbours,
+            k_neighbors=k_neighbors,
             k_obstacles=k_obstacles,
-            agent_pos_indices=agent_pos_indices,
-            neighbor_agent_pos_indices=neighbor_pos_indices,
-            obstacle_pos_indices=obstacle_pos_indices,
-            share_params=cfg.model.shared_parameters,
             dropout=dropout,
+            pos_indices=slice(0,2),
             device=cfg.train.device,
         ),
         NormalParamExtractor(),
