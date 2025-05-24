@@ -14,20 +14,48 @@ from torchrl.record.loggers import generate_exp_name, get_logger, Logger
 from torchrl.record.loggers.wandb import WandbLogger
 
 
-def init_logging(cfg, model_name: str):
+def init_logging(cfg, model_name: str, run_description: str = None, tags: list = None):
+    # Create experiment name incorporating description if provided
+    base_exp_name = generate_exp_name(cfg.env.scenario_name, model_name)
+    
+    if run_description:
+        # Option 1: Use description as the main experiment name
+        experiment_name = run_description
+        # Option 2: Combine with generated name (uncomment if preferred)
+        # experiment_name = f"{base_exp_name}_{run_description}"
+    else:
+        experiment_name = base_exp_name
+    
+    # Prepare wandb kwargs with enhanced naming and metadata
+    wandb_kwargs = {
+        "group": cfg.logger.group_name or model_name,
+        "project": cfg.logger.project_name or f"torchrl_example_{cfg.env.scenario_name}",
+        "name": experiment_name,  # This becomes the run name in WandB
+        "tags": tags or [],       # Tags for filtering/organizing runs
+    }
+    
+    # Add notes/description if provided
+    if run_description:
+        wandb_kwargs["notes"] = run_description
+    
     logger = get_logger(
         logger_type=cfg.logger.backend,
         logger_name=os.getcwd(),
-        experiment_name=generate_exp_name(cfg.env.scenario_name, model_name),
-        wandb_kwargs={
-            "group": cfg.logger.group_name or model_name,
-            "project": cfg.logger.project_name
-            or f"torchrl_example_{cfg.env.scenario_name}",
-        },
+        experiment_name=experiment_name,
+        wandb_kwargs=wandb_kwargs,
     )
+    
+    # Log hyperparameters including run metadata
     logger.log_hparams(cfg)
+    
+    # If using WandB, add run description to summary for easy access
+    if cfg.logger.backend == "wandb" and hasattr(logger, 'experiment'):
+        if run_description:
+            logger.experiment.summary["run_description"] = run_description
+        if tags:
+            logger.experiment.summary["run_tags"] = tags
+    
     return logger
-
 
 def log_training(
     logger: Logger,

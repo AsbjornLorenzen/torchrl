@@ -1,4 +1,6 @@
 seed: 0
+run_description: null
+tags: []
 
 env:
   max_steps: 300
@@ -43,7 +45,7 @@ train:
 
 eval:
   evaluation_interval: 10
-  evaluation_episodes: 200
+  evaluation_episodes: 20
 
 logger:
   backend: wandb # Delete to remove logging

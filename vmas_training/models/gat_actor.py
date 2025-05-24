@@ -236,9 +236,9 @@ class PGATActor(nn.Module):
         # You may need to adapt this based on your specific observation structure
         obstacle_pos = None
         if self.obstacle_pos_indices is not None and self.k_obstacles is not None:
-            # This is a placeholder - adapt based on how obstacles are encoded
-            # obstacle_pos = obs[:, :, self.obstacle_pos_indices]
-            pass
+            obstacle_pos = obs[:, :, self.obstacle_pos_indices]
+
+        neighbor_pos = obs[:,:, self.neighbor_agent_pos_indices]
             
         return agent_pos, features, obstacle_pos
         

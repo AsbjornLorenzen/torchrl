@@ -8,6 +8,7 @@ import time
 import os
 import hydra
 import torch
+import datetime
 
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
@@ -31,6 +32,57 @@ from models.gnn_critic import GNNCritic
 
 def rendering_callback(env, td):
     env.frames.append(env.render(mode="rgb_array", agent_index_focus=None))
+
+def extract_episode_metrics(rollouts, env):
+    """Extract detailed episode metrics from evaluation rollouts"""
+    
+    # Get the final info from each episode
+    # rollouts has shape [n_envs, max_steps, ...]
+    batch_size = rollouts.batch_size[0]  # number of environments
+    
+    metrics = {
+        'total_agent_collisions': 0,
+        'total_obstacle_collisions': 0,
+        'avg_time_to_formation': 0,
+        'formation_success_rate': 0,
+        'episodes_evaluated': batch_size,
+        'avg_formation_error': 0
+    }
+    
+    try:
+        # Get episode metrics from the environment
+        # get from agent 0 (all agents have identical data)
+        episode_metrics = rollouts['agents']['info']
+        
+        # Aggregate metrics across all environments
+        metrics['total_agent_collisions'] = episode_metrics['agent_collisions'][:,-1,0,0].sum().item()
+        metrics['total_obstacle_collisions'] = episode_metrics['obstacle_collisions'][:,-1,0,0].sum().item()
+        
+        # Formation metrics
+        formation_achieved = episode_metrics['formation_achieved'][:,-1,0,0]
+        time_to_formation = episode_metrics['time_to_formation'][:,-1,0,0]
+        
+        # Only consider episodes where formation was achieved for average time
+        achieved_mask = formation_achieved > 0
+        if achieved_mask.sum() > 0:
+            metrics['avg_time_to_formation'] = time_to_formation[achieved_mask].float().mean().item()
+        else:
+            metrics['avg_time_to_formation'] = -1  # Indicates no formation achieved
+        
+        metrics['formation_success_rate'] = formation_achieved.mean().item()
+        
+        # Additional metrics
+        metrics['avg_agent_collisions_per_episode'] = metrics['total_agent_collisions'] / batch_size
+        metrics['avg_obstacle_collisions_per_episode'] = metrics['total_obstacle_collisions'] / batch_size
+
+        metrics['avg_formation_error'] = episode_metrics['formation_accuracy_per_step'].mean().item()
+        
+    except Exception as e:
+        print(f"Warning: Could not extract episode metrics: {e}")
+        # Return default metrics if extraction fails
+        pass
+    
+    return metrics
 
 def save_model_snapshot(policy, value_module, iteration, metrics=None):
     """
@@ -76,6 +128,16 @@ def save_model_snapshot(policy, value_module, iteration, metrics=None):
 
 @hydra.main(version_base="1.1", config_path="", config_name="mappo_gat")
 def train(cfg: "DictConfig"):  # noqa: F821
+    # Handle run description - priority: CLI override > env var > default
+    run_description = cfg.get("run_description") or os.getenv("RUN_DESCRIPTION") or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_tags = cfg.get("tags", [])
+    
+    # Add to config for complete tracking
+    cfg.run_description = run_description
+    cfg.tags = run_tags
+
+
+
     # Device
     cfg.train.device = "cpu" if not torch.cuda.device_count() else "cuda:0"
     cfg.env.device = cfg.train.device
@@ -130,7 +192,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
     agent_pos_indices_list = cfg.model.get("agent_pos_indices", [0, 2])
     agent_pos_indices = slice(agent_pos_indices_list[0], agent_pos_indices_list[1])
 
-    neighbor_pos_indices_list = [10, 10 + (k_neighbors * 2)]
+    neighbor_pos_indices_list = [12, 12 + (k_neighbors * 2)]
     neighbor_pos_indices = slice(neighbor_pos_indices_list[0], neighbor_pos_indices_list[1])
     obstacle_pos_indices_list = [neighbor_pos_indices_list[1], neighbor_pos_indices_list[1] + (k_obstacles * 2)]
     obstacle_pos_indices = slice(obstacle_pos_indices_list[0], obstacle_pos_indices_list[1])
@@ -166,6 +228,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         in_keys=[("agents", "observation")],
         out_keys=[("agents", "loc"), ("agents", "scale")],
     )
+
     lowest_action = torch.zeros_like(env.full_action_spec_unbatched[("agents", "action")].space.low, device=cfg.train.device)
 
     policy = ProbabilisticActor(
@@ -242,16 +305,46 @@ def train(cfg: "DictConfig"):  # noqa: F821
             + ("MA" if cfg.model.centralised_critic else "I")
             + "PPO"
         )
-        logger = init_logging(cfg, model_name)
+        logger = init_logging(cfg, model_name, run_description, run_tags)
 
     total_time = 0
     total_frames = 0
     sampling_start = time.time()
-    best_mean_reward = float('-inf')
     for i, tensordict_data in enumerate(collector):
         torchrl_logger.info(f"\nIteration {i}")
 
         sampling_time = time.time() - sampling_start
+
+        # Extract episode metrics
+        with torch.no_grad():
+            training_episode_metrics = extract_episode_metrics(tensordict_data, env)
+
+        # Log training episode metrics
+        if cfg.logger.backend:
+            if cfg.logger.backend == "wandb":
+                logger.experiment.log({
+                    # Training episode-specific metrics
+                    "train/total_agent_collisions": training_episode_metrics['total_agent_collisions'],
+                    "train/total_obstacle_collisions": training_episode_metrics['total_obstacle_collisions'],
+                    "train/avg_agent_collisions_per_episode": training_episode_metrics['avg_agent_collisions_per_episode'],
+                    "train/avg_obstacle_collisions_per_episode": training_episode_metrics['avg_obstacle_collisions_per_episode'],
+                    "train/formation_success_rate": training_episode_metrics['formation_success_rate'],
+                    "train/avg_time_to_formation": training_episode_metrics['avg_time_to_formation'],
+                    "train/episodes_evaluated": training_episode_metrics['episodes_evaluated'],
+                    "train/avg_formation_error": training_episode_metrics['avg_formation_error'],
+                }, step=i)
+            
+            # Print training metrics
+            torchrl_logger.info(
+                f"Training Metrics (Iteration {i}):\n"
+                f"  Formation Success Rate: {training_episode_metrics['formation_success_rate']:.3f}\n"
+                f"  Avg Time to Formation: {training_episode_metrics['avg_time_to_formation']:.1f} steps\n"
+                f"  Total Agent Collisions: {training_episode_metrics['total_agent_collisions']}\n"
+                f"  Total Obstacle Collisions: {training_episode_metrics['total_obstacle_collisions']}\n"
+                f"  Avg Collisions per Episode: Agent={training_episode_metrics['avg_agent_collisions_per_episode']:.2f}, "
+                f"Obstacle={training_episode_metrics['avg_obstacle_collisions_per_episode']:.2f}"
+            )
+
 
         with torch.no_grad():
             loss_module.value_estimator(
@@ -330,7 +423,32 @@ def train(cfg: "DictConfig"):  # noqa: F821
 
                 evaluation_time = time.time() - evaluation_start
 
+                episode_metrics = extract_episode_metrics(rollouts, env_test)
                 eval_metrics = log_evaluation(logger, rollouts, env_test, evaluation_time, step=i)
+
+                # Log detailed episode metrics
+                if cfg.logger.backend == "wandb":
+                    logger.experiment.log({
+                        # Episode-specific metrics
+                        "eval/total_agent_collisions": episode_metrics['total_agent_collisions'],
+                        "eval/total_obstacle_collisions": episode_metrics['total_obstacle_collisions'],
+                        "eval/avg_agent_collisions_per_episode": episode_metrics['avg_agent_collisions_per_episode'],
+                        "eval/avg_obstacle_collisions_per_episode": episode_metrics['avg_obstacle_collisions_per_episode'],
+                        "eval/formation_success_rate": episode_metrics['formation_success_rate'],
+                        "eval/avg_time_to_formation": episode_metrics['avg_time_to_formation'],
+                        "eval/episodes_evaluated": episode_metrics['episodes_evaluated'],
+                    }, step=i)
+                
+                # Print detailed metrics
+                torchrl_logger.info(
+                    f"Evaluation Metrics (Iteration {i}):\n"
+                    f"  Formation Success Rate: {episode_metrics['formation_success_rate']:.3f}\n"
+                    f"  Avg Time to Formation: {episode_metrics['avg_time_to_formation']:.1f} steps\n"
+                    f"  Total Agent Collisions: {episode_metrics['total_agent_collisions']}\n"
+                    f"  Total Obstacle Collisions: {episode_metrics['total_obstacle_collisions']}\n"
+                    f"  Avg Collisions per Episode: Agent={episode_metrics['avg_agent_collisions_per_episode']:.2f}, "
+                    f"Obstacle={episode_metrics['avg_obstacle_collisions_per_episode']:.2f}"
+                )
 
                 # SAVE SNAPSHOT 
                 # Extract mean reward for model saving decision
