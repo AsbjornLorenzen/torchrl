@@ -73,162 +73,197 @@ class ObservationConfig:
         ]
 
 
-class EnhancedPositionAwareGATLayer(MessagePassing):
+
+class PGATCrossAttentionLayer(nn.Module):
     """
-    Enhanced GAT layer with position-based attention and separate agent/obstacle processing
+    PGAT Cross-Attention Layer implementing the paper's approach:
+    - Query: Agent's own state  
+    - Key/Value: Separate processing for neighbor agents and obstacles
+    - Distance-based attention weights
     """
     def __init__(self, 
-                 query_dim: int, 
-                 key_dim: int, 
-                 value_dim: int,
-                 out_channels: int, 
-                 heads: int = 4, 
-                 concat: bool = True, 
+                 query_dim: int,
+                 agent_key_dim: int,
+                 agent_value_dim: int, 
+                 obstacle_key_dim: int,
+                 obstacle_value_dim: int,
+                 out_channels: int,
+                 heads: int = 4,
                  dropout: float = 0.0,
-                 bias: bool = True,
-                 use_position_attention: bool = True,
                  c_agent_decay: float = 1.0,
                  c_obstacle_decay: float = 2.0,
                  device=None):
-        super().__init__(aggr='add', node_dim=0)
+        super().__init__()
         
         self.query_dim = query_dim
-        self.key_dim = key_dim  
-        self.value_dim = value_dim
+        self.agent_key_dim = agent_key_dim
+        self.agent_value_dim = agent_value_dim
+        self.obstacle_key_dim = obstacle_key_dim
+        self.obstacle_value_dim = obstacle_value_dim
         self.out_channels = out_channels
         self.heads = heads
-        self.concat = concat
         self.dropout = dropout
-        self.use_position_attention = use_position_attention
         self.device = device if device is not None else torch.device('cpu')
         
-        # Position attention decay coefficients
-        self.c_agent_decay = nn.Parameter(torch.tensor(c_agent_decay)) if use_position_attention else c_agent_decay
-        self.c_obstacle_decay = nn.Parameter(torch.tensor(c_obstacle_decay)) if use_position_attention else c_obstacle_decay
+        # Distance-based attention decay coefficients (learnable parameters)
+        self.c_agent_decay = nn.Parameter(torch.tensor(c_agent_decay, device=self.device).clamp(min=0.1))
+        self.c_obstacle_decay = nn.Parameter(torch.tensor(c_obstacle_decay, device=self.device).clamp(min=0.1))
         
-        # Linear transformations for Q/K/V
-        self.lin_query = nn.Linear(query_dim, heads * out_channels, bias=False).to(self.device)
-        self.lin_key = nn.Linear(key_dim, heads * out_channels, bias=False).to(self.device)
-        self.lin_value = nn.Linear(value_dim, heads * out_channels, bias=False).to(self.device)
+        # Linear transformations for Query
+        self.lin_query = nn.Linear(query_dim, heads * out_channels, bias=False, device=self.device)
         
-        # Output projection
-        if concat:
-            self.lin_out = nn.Linear(heads * out_channels, out_channels, bias=bias).to(self.device)
-        else:
-            self.lin_out = nn.Linear(out_channels, out_channels, bias=bias).to(self.device)
-            
+        # Separate linear transformations for agent neighbors
+        self.lin_agent_key = nn.Linear(agent_key_dim, heads * out_channels, bias=False, device=self.device)
+        self.lin_agent_value = nn.Linear(agent_value_dim, heads * out_channels, bias=False, device=self.device)
+        
+        # Separate linear transformations for obstacles  
+        self.lin_obstacle_key = nn.Linear(obstacle_key_dim, heads * out_channels, bias=False, device=self.device)
+        self.lin_obstacle_value = nn.Linear(obstacle_value_dim, heads * out_channels, bias=False, device=self.device)
+        
+        # Output projection networks for concatenated features
+        self.agent_proj = nn.Linear(heads * out_channels, out_channels, device=self.device)
+        self.obstacle_proj = nn.Linear(heads * out_channels, out_channels, device=self.device)
+        self.final_proj = nn.Linear(2 * out_channels, out_channels, device=self.device)  # For concatenation
+        
         # Attention scaling factor
         self.scale = (out_channels // heads) ** -0.5
         
         self.reset_parameters()
 
-        
     def reset_parameters(self):
-        nn.init.xavier_uniform_(self.lin_query.weight)
-        nn.init.xavier_uniform_(self.lin_key.weight)
-        nn.init.xavier_uniform_(self.lin_value.weight)
-        nn.init.xavier_uniform_(self.lin_out.weight)
-        if hasattr(self.lin_out, 'bias') and self.lin_out.bias is not None:
-            nn.init.zeros_(self.lin_out.bias)
-            
+        for module in [self.lin_query, self.lin_agent_key, self.lin_agent_value, 
+                      self.lin_obstacle_key, self.lin_obstacle_value,
+                      self.agent_proj, self.obstacle_proj, self.final_proj]:
+            if hasattr(module, 'weight'):
+                nn.init.xavier_uniform_(module.weight)
+            if hasattr(module, 'bias') and module.bias is not None:
+                nn.init.zeros_(module.bias)
+    
     def forward(self, 
-                query_features: torch.Tensor,
-                key_features: torch.Tensor, 
-                value_features: torch.Tensor,
-                edge_index: torch.Tensor,
-                positions: Optional[torch.Tensor] = None,
-                edge_type: Optional[torch.Tensor] = None) -> torch.Tensor:
+                query_features: torch.Tensor,           # [n_agents, query_dim]
+                agent_key_features: torch.Tensor,       # [n_agents, k_neighbors, agent_key_dim] 
+                agent_value_features: torch.Tensor,     # [n_agents, k_neighbors, agent_value_dim]
+                obstacle_key_features: torch.Tensor,    # [n_agents, k_obstacles, obstacle_key_dim]
+                obstacle_value_features: torch.Tensor,  # [n_agents, k_obstacles, obstacle_value_dim]
+                agent_positions: torch.Tensor,          # [n_agents, 2]
+                neighbor_positions: torch.Tensor,       # [n_agents, k_neighbors, 2]
+                obstacle_positions: torch.Tensor,       # [n_agents, k_obstacles, 2]
+                ) -> torch.Tensor:
         """
-        Args:
-            query_features: Query features [num_nodes, query_dim]
-            key_features: Key features [num_nodes, key_dim]  
-            value_features: Value features [num_nodes, value_dim]
-            edge_index: Edge indices [2, num_edges]
-            edge_type: Optional edge types
+        Cross-attention between agents and their neighbors/obstacles
         """
+        n_agents = query_features.shape[0]
         H, C = self.heads, self.out_channels
         
-        # Transform to Q/K/V
-        query = self.lin_query(query_features).view(-1, H, C)
-        key = self.lin_key(key_features).view(-1, H, C)
-        value = self.lin_value(value_features).view(-1, H, C)
+        # Transform queries (from agent's own state)
+        query = self.lin_query(query_features).view(n_agents, H, C)  # [n_agents, heads, out_channels]
         
-        # Propagate messages with positions
-        out = self.propagate(
-            edge_index, 
-            query=query, 
-            key=key, 
-            value=value,
-            pos=positions,  # Pass positions to message function
-            edge_type=edge_type,
-            size=None
-        )
+        # Process agent neighbors
+        agent_attended = self._attend_to_agents(
+            query, agent_key_features, agent_value_features, 
+            agent_positions, neighbor_positions
+        )  # [n_agents, out_channels]
         
-        # Reshape and apply output projection
-        if self.concat:
-            out = out.view(-1, H * C)
-        else:
-            out = out.mean(dim=1)
-            
-        out = self.lin_out(out)
+        # Process obstacles  
+        obstacle_attended = self._attend_to_obstacles(
+            query, obstacle_key_features, obstacle_value_features,
+            agent_positions, obstacle_positions  
+        )  # [n_agents, out_channels]
         
-        return out
+        # Concatenate and project
+        combined = torch.cat([agent_attended, obstacle_attended], dim=-1)  # [n_agents, 2*out_channels]
+        output = self.final_proj(combined)  # [n_agents, out_channels]
+        
+        return output
+    
+    def _attend_to_agents(self, query, agent_key_features, agent_value_features, 
+                         agent_positions, neighbor_positions):
+        """Attend to neighboring agents"""
+        n_agents, k_neighbors = agent_key_features.shape[:2]
+        H, C = self.heads, self.out_channels
+        
+        if k_neighbors == 0:
+            return torch.zeros(n_agents, C, device=self.device)
+        
+        # Transform keys and values
+        agent_keys = self.lin_agent_key(agent_key_features).view(n_agents, k_neighbors, H, C)
+        agent_values = self.lin_agent_value(agent_value_features).view(n_agents, k_neighbors, H, C)
+        
+        # Calculate distance-based attention weights
+        # agent_positions: [n_agents, 2], neighbor_positions: [n_agents, k_neighbors, 2]
+        distances = torch.norm(
+            agent_positions.unsqueeze(1) - neighbor_positions, 
+            dim=-1, keepdim=True
+        )  # [n_agents, k_neighbors, 1]
+        
+        # Distance-based weights: exp(-c * distance)
+        distance_weights = torch.exp(-self.c_agent_decay * distances)  # [n_agents, k_neighbors, 1]
+        
+        # Dot-product attention
+        # query: [n_agents, H, C], agent_keys: [n_agents, k_neighbors, H, C]
+        dot_attention = torch.einsum('nhc,nkhc->nhk', query, agent_keys) * self.scale  # [n_agents, H, k_neighbors]
+        
+        # Combine with distance weights
+        # distance_weights: [n_agents, k_neighbors, 1] -> [n_agents, 1, k_neighbors]
+        combined_attention = dot_attention * distance_weights.squeeze(-1).unsqueeze(1)  # [n_agents, H, k_neighbors]
+        
+        # Apply softmax
+        attention_weights = F.softmax(combined_attention, dim=-1)  # [n_agents, H, k_neighbors]
+        attention_weights = F.dropout(attention_weights, p=self.dropout, training=self.training)
+        
+        # Apply attention to values
+        # attention_weights: [n_agents, H, k_neighbors], agent_values: [n_agents, k_neighbors, H, C]
+        attended = torch.einsum('nhk,nkhc->nhc', attention_weights, agent_values)  # [n_agents, H, C]
+        
+        # Project and aggregate across heads
+        attended = attended.view(n_agents, -1)
 
+        return self.agent_proj(attended)
+    
+    def _attend_to_obstacles(self, query, obstacle_key_features, obstacle_value_features,
+                           agent_positions, obstacle_positions):
+        """Attend to obstacles"""
+        n_agents, k_obstacles = obstacle_key_features.shape[:2]
+        H, C = self.heads, self.out_channels
+        
+        if k_obstacles == 0:
+            return torch.zeros(n_agents, C, device=self.device)
+        
+        # Transform keys and values
+        obstacle_keys = self.lin_obstacle_key(obstacle_key_features).view(n_agents, k_obstacles, H, C)
+        obstacle_values = self.lin_obstacle_value(obstacle_value_features).view(n_agents, k_obstacles, H, C)
+        
+        # Calculate distance-based attention weights
+        distances = torch.norm(
+            agent_positions.unsqueeze(1) - obstacle_positions, 
+            dim=-1, keepdim=True
+        )  # [n_agents, k_obstacles, 1]
+        
+        distance_weights = torch.exp(-self.c_obstacle_decay * distances)  # [n_agents, k_obstacles, 1]
+        
+        # Dot-product attention  
+        dot_attention = torch.einsum('nhc,nkhc->nhk', query, obstacle_keys) * self.scale  # [n_agents, H, k_obstacles]
+        
+        # Combine with distance weights
+        combined_attention = dot_attention * distance_weights.squeeze(-1).unsqueeze(1)  # [n_agents, H, k_obstacles]
+        
+        # Apply softmax
+        attention_weights = F.softmax(combined_attention, dim=-1)  # [n_agents, H, k_obstacles]  
+        attention_weights = F.dropout(attention_weights, p=self.dropout, training=self.training)
+        
+        # Apply attention to values
+        attended = torch.einsum('nhk,nkhc->nhc', attention_weights, obstacle_values)  # [n_agents, H, C]
+        
+        # Project and aggregate across heads
+        attended = attended.view(n_agents, -1)  # [n_agents, H*C]
 
-    def message(self, query_i: torch.Tensor, key_j: torch.Tensor, 
-                value_j: torch.Tensor, index: torch.Tensor,
-                ptr: Optional[torch.Tensor], size_i: Optional[int],
-                pos_i: Optional[torch.Tensor] = None,
-                pos_j: Optional[torch.Tensor] = None,
-                edge_type: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Enhanced message function with position-based attention"""
-        
-        # Standard dot-product attention
-        alpha = (query_i * key_j).sum(dim=-1) * self.scale  # [num_edges, heads]
-        
-        # Add position-based attention if positions are available
-        if self.use_position_attention and pos_i is not None and pos_j is not None:
-            # Calculate distances
-            dist = torch.norm(pos_i - pos_j, dim=-1, keepdim=True)  # [num_edges, 1]
-            
-            # Apply different decay coefficients based on edge type
-            if edge_type is not None:
-                # edge_type: 0 for agent-agent, 1 for agent-obstacle
-                decay_coeff = torch.where(
-                    edge_type.unsqueeze(-1) == 0,  # agent-agent edges
-                    self.c_agent_decay,
-                    self.c_obstacle_decay  # agent-obstacle edges
-                )
-            else:
-                # Default to agent decay if no edge types provided
-                decay_coeff = self.c_agent_decay
-                
-            # Exponential distance-based weighting
-            pos_weight = torch.exp(-decay_coeff * dist)  # [num_edges, 1]
-            
-            # Combine attention scores with position weights
-            alpha = alpha * pos_weight.squeeze(-1)  # [num_edges, heads]
-        
-        # Apply softmax normalization
-        alpha = softmax(alpha, index, ptr, size_i)
-        
-        # Apply dropout
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
-        
-        # Weight values by attention
-        out = value_j * alpha.unsqueeze(-1)  # [num_edges, heads, out_channels]
-        
-        return out
+        return self.obstacle_proj(attended)
 
-
-class EnhancedPGATActor(nn.Module):
-    """
-    Enhanced PGAT Actor with nearest neighbor edge construction and proper Q/K/V extraction
-    """
+class MultiLayerEnhancedPGATActor(nn.Module):
     def __init__(
         self,
         obs_config: ObservationConfig,
-        total_obs_dim: int,               # Total observation dimension including neighbors/obstacles
+        total_obs_dim: int,
         n_agent_outputs: int,
         gnn_hidden_dim: int = 128,
         n_gnn_layers: int = 2,
@@ -236,17 +271,9 @@ class EnhancedPGATActor(nn.Module):
         k_neighbours: Optional[int] = None,
         k_obstacles: Optional[int] = None,
         dropout: float = 0.0,
-        pos_indices: slice = slice(0, 2),  # Position indices in observation
+        pos_indices: slice = slice(0, 2),
         device=None,
     ):
-        """
-        Args:
-            obs_config: Configuration for observation indexing
-            total_obs_dim: Total dimension of each agent's observation
-            n_agent_outputs: Dimension of agent output (actions)
-            pos_indices: Slice indicating where positions are in the observation
-            ... other args
-        """
         super().__init__()
         
         self.obs_config = obs_config
@@ -256,57 +283,62 @@ class EnhancedPGATActor(nn.Module):
         self.k_obstacles = k_obstacles or obs_config.k_obstacles
         self.pos_indices = pos_indices
         self.device = device if device is not None else torch.device('cpu')
+        self.n_gnn_layers = n_gnn_layers
         
-        # Calculate Q/K/V dimensions based on observation config
+        # Calculate dimensions
         self.query_dim = self._calculate_feature_dim(obs_config.get_agent_query_indices())
+        self.agent_key_dim = self._calculate_feature_dim(obs_config.get_neighbor_key_indices())
+        self.agent_value_dim = self._calculate_feature_dim(obs_config.get_neighbor_value_indices())
+        self.obstacle_key_dim = self._calculate_feature_dim(obs_config.get_obstacle_key_indices())
+        self.obstacle_value_dim = self._calculate_feature_dim(obs_config.get_obstacle_value_indices())
         
-        # Key dimension: neighbor features + obstacle features
-        neighbor_key_dim = self._calculate_feature_dim(obs_config.get_neighbor_key_indices())
-        obstacle_key_dim = self._calculate_feature_dim(obs_config.get_obstacle_key_indices())
-        self.key_dim = neighbor_key_dim + obstacle_key_dim
-        
-        # Value dimension: neighbor features + obstacle features  
-        neighbor_value_dim = self._calculate_feature_dim(obs_config.get_neighbor_value_indices())
-        obstacle_value_dim = self._calculate_feature_dim(obs_config.get_obstacle_value_indices())
-        self.value_dim = neighbor_value_dim + obstacle_value_dim
-        
-        print(f"Q/K/V dimensions: {self.query_dim}/{self.key_dim}/{self.value_dim}")
-        
-        # Build GAT layers
-        self.gat_layers = nn.ModuleList()
+        # Build PGAT layers
+        self.pgat_layers = nn.ModuleList()
         
         for i in range(n_gnn_layers):
             if i == 0:
-                # First layer uses extracted Q/K/V from observations
-                layer = EnhancedPositionAwareGATLayer(
+                # First layer uses extracted features from observations
+                layer = PGATCrossAttentionLayer(
                     query_dim=self.query_dim,
-                    key_dim=self.key_dim,
-                    value_dim=self.value_dim,
+                    agent_key_dim=self.agent_key_dim,
+                    agent_value_dim=self.agent_value_dim,
+                    obstacle_key_dim=self.obstacle_key_dim,  
+                    obstacle_value_dim=self.obstacle_value_dim,
                     out_channels=gnn_hidden_dim,
                     heads=n_attention_heads,
-                    concat=True,
                     dropout=dropout,
                     device=self.device
                 )
             else:
                 # Subsequent layers use hidden representations
-                layer = EnhancedPositionAwareGATLayer(
+                layer = PGATCrossAttentionLayer(
                     query_dim=gnn_hidden_dim,
-                    key_dim=gnn_hidden_dim,
-                    value_dim=gnn_hidden_dim,
+                    agent_key_dim=gnn_hidden_dim, 
+                    agent_value_dim=gnn_hidden_dim,
+                    obstacle_key_dim=gnn_hidden_dim,
+                    obstacle_value_dim=gnn_hidden_dim,
                     out_channels=gnn_hidden_dim,
                     heads=n_attention_heads,
-                    concat=True,
                     dropout=dropout,
                     device=self.device
                 )
-            self.gat_layers.append(layer)
-            
+            self.pgat_layers.append(layer)
+        
+        # Neighbor/obstacle embedding projections for subsequent layers
+        self.neighbor_projections = nn.ModuleList([
+            nn.Linear(gnn_hidden_dim, gnn_hidden_dim) 
+            for _ in range(n_gnn_layers - 1)
+        ])
+        self.obstacle_projections = nn.ModuleList([
+            nn.Linear(gnn_hidden_dim, gnn_hidden_dim) 
+            for _ in range(n_gnn_layers - 1)
+        ])
+        
         # Output MLP
         self.output_mlp = nn.Sequential(
             nn.Linear(gnn_hidden_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(256, 256), 
             nn.ReLU(),
             nn.Linear(256, n_agent_outputs)
         ).to(self.device)
@@ -325,158 +357,98 @@ class EnhancedPGATActor(nn.Module):
             features.append(obs[..., s])
         return torch.cat(features, dim=-1)
 
-    def _extract_positions(self, obs: torch.Tensor) -> torch.Tensor:
-        """Extract positions from flattened observations"""
-        batch_size = obs.shape[0] // self.total_obs_dim if obs.dim() == 1 else obs.shape[0]
+    def _extract_neighbor_features(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract neighbor and obstacle features"""
+        batch_size = obs.shape[0]
         
-        if obs.dim() == 2:  # Already flattened: [batch_size * n_agents, obs_dim]
-            positions = obs[:, self.pos_indices]  # [batch_size * n_agents, 2]
-        else:  # 3D tensor: [batch_size, n_agents, obs_dim]
-            positions = obs[:, :, self.pos_indices].reshape(-1, 2)  # Flatten to [batch_size * n_agents, 2]
+        # Extract raw features
+        neighbor_keys_raw = self._extract_features_from_obs(obs, self.obs_config.get_neighbor_key_indices())
+        neighbor_values_raw = self._extract_features_from_obs(obs, self.obs_config.get_neighbor_value_indices())
+        obstacle_keys_raw = self._extract_features_from_obs(obs, self.obs_config.get_obstacle_key_indices())
+        obstacle_values_raw = self._extract_features_from_obs(obs, self.obs_config.get_obstacle_value_indices())
         
-        return positions
+        # Reshape to separate individual neighbors/obstacles
+        agent_key_features = neighbor_keys_raw.view(batch_size, self.k_neighbours, -1)
+        agent_value_features = neighbor_values_raw.view(batch_size, self.k_neighbours, -1)
+        obstacle_key_features = obstacle_keys_raw.view(batch_size, self.k_obstacles, -1) 
+        obstacle_value_features = obstacle_values_raw.view(batch_size, self.k_obstacles, -1)
+        
+        return agent_key_features, agent_value_features, obstacle_key_features, obstacle_value_features
 
-
-    def _extract_qkv_features_separated(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Extract Q/K/V features with separate agent and obstacle processing
-        Returns: (query, agent_key, agent_value, obstacle_key, obstacle_value)
-        """
-        # Query: agent's own state
-        query_features = self._extract_features_from_obs(obs, self.obs_config.get_agent_query_indices())
+    def _extract_positions(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract positions for agents, neighbors, and obstacles"""
+        batch_size = obs.shape[0]
         
-        # Separate agent and obstacle features
-        agent_key_features = self._extract_features_from_obs(obs, self.obs_config.get_neighbor_key_indices())
-        agent_value_features = self._extract_features_from_obs(obs, self.obs_config.get_neighbor_value_indices())
+        # Extract agent's own position
+        agent_positions = obs[:, self.pos_indices]  # [batch_size, 2]
         
-        obstacle_key_features = self._extract_features_from_obs(obs, self.obs_config.get_obstacle_key_indices())
-        obstacle_value_features = self._extract_features_from_obs(obs, self.obs_config.get_obstacle_value_indices())
+        # Extract neighbor positions from the neighbor block
+        neighbor_block = obs[:, self.obs_config.neighbor_block_idx]  
+        neighbor_block = neighbor_block.view(batch_size, self.k_neighbours, self.obs_config.neighbor_obs_dim)  
+        neighbor_positions = neighbor_block[:, :, :2]  # Assuming first 2 are positions
         
-        return query_features, agent_key_features, agent_value_features, obstacle_key_features, obstacle_value_features
-
-
-    def _build_graph_batch(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Build graph edges based on k-nearest neighbors using agent positions.
-        Adapted from the GNNActor implementation.
+        # Extract obstacle positions
+        obstacle_block = obs[:, self.obs_config.obstacle_block_idx]  
+        obstacle_positions = obstacle_block.view(batch_size, self.k_obstacles, 2)  
         
-        Args:
-            obs (torch.Tensor): Observation tensor of shape (batch_size, n_agents, obs_dim)
-            
-        Returns:
-            tuple(torch.Tensor, torch.Tensor):
-                - edge_index (torch.Tensor): Edge indices, shape (2, num_total_edges)
-                - edge_type (torch.Tensor): Edge types (all zeros for agent-agent edges)
-        """
-        batch_size, n_agents, obs_dim = obs.shape
-        
-        if n_agents == 0:  # Handle case with no agents
-            return (torch.empty(2, 0, dtype=torch.long, device=self.device),
-                    torch.empty(0, dtype=torch.long, device=self.device))
-        
-        # Extract positions for distance calculation
-        pos = obs[:, :, self.pos_indices].to(self.device)  # (batch_size, n_agents, 2)
-        
-        # Calculate pairwise distances within each batch element
-        # Shape: (batch_size, n_agents, n_agents)
-        dist = torch.cdist(pos, pos, p=2)
-        
-        # Find k-nearest neighbors (including self for now)
-        if self.k_neighbours is not None and self.k_neighbours > 0:
-            # Get k+1 nearest neighbors (including self)
-            knn_val, knn_idx = torch.topk(dist, k=min(self.k_neighbours + 1, n_agents), 
-                                         dim=-1, largest=False, sorted=True)
-            
-            # Remove self-connections (first element is always self with distance 0)
-            if knn_idx.shape[-1] > 1:
-                neighbor_idx = knn_idx[..., 1:]  # Shape: (batch_size, n_agents, k)
-                k_actual = neighbor_idx.shape[-1]
-            else:
-                neighbor_idx = torch.empty(batch_size, n_agents, 0, dtype=torch.long, device=self.device)
-                k_actual = 0
-            
-            if k_actual > 0:
-                # Create source indices for each agent
-                source_idx = torch.arange(n_agents, device=self.device).view(1, -1, 1).expand(batch_size, -1, k_actual)
-                
-                # Flatten the source and target indices for k-NN edges
-                flat_source_knn = source_idx.reshape(batch_size, -1)  # (batch_size, n_agents * k)
-                flat_target_knn = neighbor_idx.reshape(batch_size, -1)  # (batch_size, n_agents * k)
-                
-                # Construct k-NN edge_index for the batch with proper offsets
-                row_list_knn = []
-                col_list_knn = []
-                node_offset = 0
-                for b in range(batch_size):
-                    # k-NN edges with batch offset
-                    rows_b_knn = flat_source_knn[b] + node_offset
-                    cols_b_knn = flat_target_knn[b] + node_offset
-                    row_list_knn.append(rows_b_knn)
-                    col_list_knn.append(cols_b_knn)
-                    node_offset += n_agents
-                
-                row_edge_knn = torch.cat(row_list_knn)  # Source nodes for k-NN
-                col_edge_knn = torch.cat(col_list_knn)  # Target nodes for k-NN
-                
-                knn_edge_index = torch.stack([row_edge_knn, col_edge_knn], dim=0)
-            else:
-                knn_edge_index = torch.empty(2, 0, dtype=torch.long, device=self.device)
-        else:
-            # If k_neighbours is 0 or None, create empty edge index
-            knn_edge_index = torch.empty(2, 0, dtype=torch.long, device=self.device)
-        
-        # Add self-loops for all agents
-        global_node_indices = torch.arange(batch_size * n_agents, device=self.device)
-        self_loop_edge_index = torch.stack([global_node_indices, global_node_indices], dim=0)
-        
-        # Combine k-NN edges and self-loops
-        edge_index = torch.cat([knn_edge_index, self_loop_edge_index], dim=1)
-        
-        # Create edge types (0 for k-NN edges, 0 for self-loops - all same type)
-        edge_type = torch.zeros(edge_index.shape[1], dtype=torch.long, device=self.device)
-        
-        return edge_index, edge_type
+        return agent_positions, neighbor_positions, obstacle_positions
         
     def forward(self, agent_observations: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass with nearest neighbor graph construction and proper Q/K/V extraction
-        
-        Args:
-            agent_observations: Each agent's observation
-                               [batch_size, n_agents, total_obs_dim]
-                               
-        Returns:
-            Actor outputs [batch_size, n_agents, n_agent_outputs]
+        Forward pass with multi-layer PGAT
         """
         batch_size, n_agents = agent_observations.shape[0], agent_observations.shape[1]
         
-        # Ensure input is on correct device
         obs = agent_observations.to(dtype=torch.float32, device=self.device)
         
         if batch_size == 0 or n_agents == 0:
             return torch.zeros(batch_size, n_agents, self.n_agent_outputs, device=self.device)
         
-        # Build graph structure based on spatial proximity
-        edge_index, edge_type = self._build_graph_batch(obs)
-
-        positions = obs[:, :, self.pos_indices].reshape(batch_size * n_agents, -1)
+        # Flatten for processing: [batch_size * n_agents, obs_dim]
+        x_flat = obs.reshape(batch_size * n_agents, -1)
         
-        # Flatten observations for graph processing
-        # Node features: [batch_size * n_agents, obs_dim]
-        x = obs.reshape(batch_size * n_agents, -1)
-
-
-        # Pass through GAT layers
-        for i, layer in enumerate(self.gat_layers):
+        # Extract query features (agent's own state)
+        query_features = self._extract_features_from_obs(x_flat, self.obs_config.get_agent_query_indices())
+        
+        # Extract positions (these stay constant across layers)
+        agent_pos, neighbor_pos, obstacle_pos = self._extract_positions(x_flat)
+        
+        # Initialize agent embeddings
+        x = query_features  # Start with query features
+        
+        # Track neighbor and obstacle embeddings separately
+        agent_key_feat, agent_val_feat, obs_key_feat, obs_val_feat = self._extract_neighbor_features(x_flat)
+        
+        # Pass through PGAT layers
+        for i, layer in enumerate(self.pgat_layers):
             if i == 0:
-                # First layer: extract Q/K/V from observations
-                query_features, key_features, value_features = self._extract_qkv_features(x)
-                # MODIFICATION: Pass positions to the layer
-                x = layer(query_features, key_features, value_features, edge_index, positions, edge_type)
+                # First layer: use original features
+                x = layer(
+                    query_features=x,
+                    agent_key_features=agent_key_feat,
+                    agent_value_features=agent_val_feat,
+                    obstacle_key_features=obs_key_feat,
+                    obstacle_value_features=obs_val_feat,
+                    agent_positions=agent_pos,
+                    neighbor_positions=neighbor_pos,
+                    obstacle_positions=obstacle_pos
+                )
             else:
-                # Subsequent layers: use hidden representations for Q/K/V
-                # MODIFICATION: Pass positions to subsequent layers too
-                x = layer(x, x, x, edge_index, positions, edge_type)
+                # Subsequent layers: project previous embeddings
+                # Project agent embeddings to neighbor/obstacle spaces
+                neighbor_embeddings = self.neighbor_projections[i-1](x).unsqueeze(1).expand(-1, self.k_neighbours, -1)
+                obstacle_embeddings = self.obstacle_projections[i-1](x).unsqueeze(1).expand(-1, self.k_obstacles, -1)
+                
+                x = layer(
+                    query_features=x,
+                    agent_key_features=neighbor_embeddings,
+                    agent_value_features=neighbor_embeddings,
+                    obstacle_key_features=obstacle_embeddings,
+                    obstacle_value_features=obstacle_embeddings,
+                    agent_positions=agent_pos,
+                    neighbor_positions=neighbor_pos,
+                    obstacle_positions=obstacle_pos
+                )
             
             x = F.relu(x)
             x = F.dropout(x, p=0.1, training=self.training)
@@ -487,50 +459,3 @@ class EnhancedPGATActor(nn.Module):
         return agent_outputs.view(batch_size, n_agents, -1)
 
 
-# Example usage showing nearest neighbor approach with proper Q/K/V extraction
-def create_formation_pgat_example():
-    """Example of how to set up the enhanced PGAT for formation control with nearest neighbor edges"""
-    
-    # Configure your observation structure
-    k_neighbors, k_obstacles = 2, 2
-    obs_config = ObservationConfig(k_neighbors=k_neighbors, k_obstacles=k_obstacles)
-    
-    # Calculate total observation dimension
-    agent_self_dim = 23  # Updated based on obs_config indices
-    total_obs_dim = agent_self_dim + (k_neighbors * 7) + (k_obstacles * 2)
-    
-    n_outputs = 2  # action dimensions [ax, ay]
-    
-    # Create the network
-    actor = EnhancedPGATActor(
-        obs_config=obs_config,
-        total_obs_dim=total_obs_dim,
-        n_agent_outputs=n_outputs,
-        k_neighbours=4,  # Number of nearest neighbors for graph construction
-        pos_indices=slice(0, 2),  # Position is at the beginning of observation
-    )
-    
-    return actor
-
-
-if __name__ == "__main__":
-    # Test the enhanced implementation with proper Q/K/V extraction
-    actor = create_formation_pgat_example()
-    
-    # Example input
-    batch_size, n_agents = 2, 6
-    total_obs_dim = 52
-    
-    agent_observations = torch.randn(batch_size, n_agents, total_obs_dim)
-    # Set positions to be more realistic (agents spread out)
-    agent_observations[:, :, 0:2] = torch.randn(batch_size, n_agents, 2) * 5
-    
-    # Forward pass
-    actions = actor(agent_observations)
-    print(f"Output shape: {actions.shape}")  # Should be [2, 6, 2]
-    
-    print("\nEnhanced PGAT with proper Q/K/V extraction:")
-    print("- Query: extracted from agent's own state (position, velocity, gradients, goal info)")
-    print("- Key: extracted from neighbor and obstacle observations")  
-    print("- Value: extracted from neighbor and obstacle observations (including progress)")
-    print("- Graph connectivity: k-nearest neighbors based on spatial proximity")
