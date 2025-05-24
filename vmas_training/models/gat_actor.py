@@ -75,7 +75,7 @@ class ObservationConfig:
 
 class EnhancedPositionAwareGATLayer(MessagePassing):
     """
-    Enhanced GAT layer with explicit Query/Key/Value extraction from observations
+    Enhanced GAT layer with position-based attention and separate agent/obstacle processing
     """
     def __init__(self, 
                  query_dim: int, 
@@ -85,7 +85,10 @@ class EnhancedPositionAwareGATLayer(MessagePassing):
                  heads: int = 4, 
                  concat: bool = True, 
                  dropout: float = 0.0,
-                 bias: bool = True, 
+                 bias: bool = True,
+                 use_position_attention: bool = True,
+                 c_agent_decay: float = 1.0,
+                 c_obstacle_decay: float = 2.0,
                  device=None):
         super().__init__(aggr='add', node_dim=0)
         
@@ -96,7 +99,12 @@ class EnhancedPositionAwareGATLayer(MessagePassing):
         self.heads = heads
         self.concat = concat
         self.dropout = dropout
+        self.use_position_attention = use_position_attention
         self.device = device if device is not None else torch.device('cpu')
+        
+        # Position attention decay coefficients
+        self.c_agent_decay = nn.Parameter(torch.tensor(c_agent_decay)) if use_position_attention else c_agent_decay
+        self.c_obstacle_decay = nn.Parameter(torch.tensor(c_obstacle_decay)) if use_position_attention else c_obstacle_decay
         
         # Linear transformations for Q/K/V
         self.lin_query = nn.Linear(query_dim, heads * out_channels, bias=False).to(self.device)
@@ -113,6 +121,7 @@ class EnhancedPositionAwareGATLayer(MessagePassing):
         self.scale = (out_channels // heads) ** -0.5
         
         self.reset_parameters()
+
         
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.lin_query.weight)
@@ -127,6 +136,7 @@ class EnhancedPositionAwareGATLayer(MessagePassing):
                 key_features: torch.Tensor, 
                 value_features: torch.Tensor,
                 edge_index: torch.Tensor,
+                positions: Optional[torch.Tensor] = None,
                 edge_type: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
@@ -143,9 +153,16 @@ class EnhancedPositionAwareGATLayer(MessagePassing):
         key = self.lin_key(key_features).view(-1, H, C)
         value = self.lin_value(value_features).view(-1, H, C)
         
-        # Propagate messages
-        out = self.propagate(edge_index, query=query, key=key, value=value, 
-                           size=None, edge_type=edge_type)
+        # Propagate messages with positions
+        out = self.propagate(
+            edge_index, 
+            query=query, 
+            key=key, 
+            value=value,
+            pos=positions,  # Pass positions to message function
+            edge_type=edge_type,
+            size=None
+        )
         
         # Reshape and apply output projection
         if self.concat:
@@ -156,37 +173,53 @@ class EnhancedPositionAwareGATLayer(MessagePassing):
         out = self.lin_out(out)
         
         return out
-        
+
+
     def message(self, query_i: torch.Tensor, key_j: torch.Tensor, 
                 value_j: torch.Tensor, index: torch.Tensor,
                 ptr: Optional[torch.Tensor], size_i: Optional[int],
-                edge_type: Optional[torch.Tensor] = None,
                 pos_i: Optional[torch.Tensor] = None,
-                pos_j: Optional[torch.Tensor] = None) -> torch.Tensor:
+                pos_j: Optional[torch.Tensor] = None,
+                edge_type: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Enhanced message function with position-based attention"""
         
-        if pos_i is not None and pos_j is not None:
-            # Paper-style position-based attention
-            dist = torch.norm(pos_i - pos_j, dim=-1, keepdim=True)
-            # Separate decay coefficients for agents vs obstacles
-            c_decay = 1.0  # You could make this learnable or edge-type dependent
-            pos_weight = torch.exp(-c_decay * dist)
-            
-            # Standard attention
-            alpha = (query_i * key_j).sum(dim=-1) * self.scale
-            
-            # Combine with position-based weights
-            alpha = alpha * pos_weight.squeeze(-1)
-        else:
-            # Standard attention
-            alpha = (query_i * key_j).sum(dim=-1) * self.scale
+        # Standard dot-product attention
+        alpha = (query_i * key_j).sum(dim=-1) * self.scale  # [num_edges, heads]
         
-        # Apply softmax and continue as before
+        # Add position-based attention if positions are available
+        if self.use_position_attention and pos_i is not None and pos_j is not None:
+            # Calculate distances
+            dist = torch.norm(pos_i - pos_j, dim=-1, keepdim=True)  # [num_edges, 1]
+            
+            # Apply different decay coefficients based on edge type
+            if edge_type is not None:
+                # edge_type: 0 for agent-agent, 1 for agent-obstacle
+                decay_coeff = torch.where(
+                    edge_type.unsqueeze(-1) == 0,  # agent-agent edges
+                    self.c_agent_decay,
+                    self.c_obstacle_decay  # agent-obstacle edges
+                )
+            else:
+                # Default to agent decay if no edge types provided
+                decay_coeff = self.c_agent_decay
+                
+            # Exponential distance-based weighting
+            pos_weight = torch.exp(-decay_coeff * dist)  # [num_edges, 1]
+            
+            # Combine attention scores with position weights
+            alpha = alpha * pos_weight.squeeze(-1)  # [num_edges, heads]
+        
+        # Apply softmax normalization
         alpha = softmax(alpha, index, ptr, size_i)
+        
+        # Apply dropout
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
-        out = value_j * alpha.unsqueeze(-1)
+        
+        # Weight values by attention
+        out = value_j * alpha.unsqueeze(-1)  # [num_edges, heads, out_channels]
         
         return out
+
 
 class EnhancedPGATActor(nn.Module):
     """
@@ -291,6 +324,17 @@ class EnhancedPGATActor(nn.Module):
         for s in slice_list:
             features.append(obs[..., s])
         return torch.cat(features, dim=-1)
+
+    def _extract_positions(self, obs: torch.Tensor) -> torch.Tensor:
+        """Extract positions from flattened observations"""
+        batch_size = obs.shape[0] // self.total_obs_dim if obs.dim() == 1 else obs.shape[0]
+        
+        if obs.dim() == 2:  # Already flattened: [batch_size * n_agents, obs_dim]
+            positions = obs[:, self.pos_indices]  # [batch_size * n_agents, 2]
+        else:  # 3D tensor: [batch_size, n_agents, obs_dim]
+            positions = obs[:, :, self.pos_indices].reshape(-1, 2)  # Flatten to [batch_size * n_agents, 2]
+        
+        return positions
 
 
     def _extract_qkv_features_separated(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -414,20 +458,25 @@ class EnhancedPGATActor(nn.Module):
         
         # Build graph structure based on spatial proximity
         edge_index, edge_type = self._build_graph_batch(obs)
+
+        positions = obs[:, :, self.pos_indices].reshape(batch_size * n_agents, -1)
         
         # Flatten observations for graph processing
         # Node features: [batch_size * n_agents, obs_dim]
         x = obs.reshape(batch_size * n_agents, -1)
-        
+
+
         # Pass through GAT layers
         for i, layer in enumerate(self.gat_layers):
             if i == 0:
                 # First layer: extract Q/K/V from observations
                 query_features, key_features, value_features = self._extract_qkv_features(x)
-                x = layer(query_features, key_features, value_features, edge_index, edge_type)
+                # MODIFICATION: Pass positions to the layer
+                x = layer(query_features, key_features, value_features, edge_index, positions, edge_type)
             else:
                 # Subsequent layers: use hidden representations for Q/K/V
-                x = layer(x, x, x, edge_index, edge_type)
+                # MODIFICATION: Pass positions to subsequent layers too
+                x = layer(x, x, x, edge_index, positions, edge_type)
             
             x = F.relu(x)
             x = F.dropout(x, p=0.1, training=self.training)
@@ -435,7 +484,6 @@ class EnhancedPGATActor(nn.Module):
         # Apply output MLP
         agent_outputs = self.output_mlp(x)
         
-        # Reshape back to batch format
         return agent_outputs.view(batch_size, n_agents, -1)
 
 
