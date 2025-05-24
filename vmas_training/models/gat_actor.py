@@ -72,6 +72,21 @@ class ObservationConfig:
             self.obstacle_block_idx
         ]
 
+    def get_neighbor_key_dim(self) -> int:
+        """Get dimension for individual neighbor key features"""
+        return self.neighbor_obs_dim  # 6
+    
+    def get_neighbor_value_dim(self) -> int:
+        """Get dimension for individual neighbor value features"""
+        return self.neighbor_obs_dim + 1  # 6 + 1 (progress) = 7
+    
+    def get_obstacle_key_dim(self) -> int:
+        """Get dimension for individual obstacle key features"""
+        return self.obstacle_obs_dim  # 2
+        
+    def get_obstacle_value_dim(self) -> int:
+        """Get dimension for individual obstacle value features"""
+        return self.obstacle_obs_dim  # 2
 
 
 class PGATCrossAttentionLayer(nn.Module):
@@ -156,7 +171,7 @@ class PGATCrossAttentionLayer(nn.Module):
         H, C = self.heads, self.out_channels
         
         # Transform queries (from agent's own state)
-        query = self.lin_query(query_features).view(n_agents, H, C)  # [n_agents, heads, out_channels]
+        query = self.lin_query(query_features).reshape(n_agents, H, C)  # [n_agents, heads, out_channels]
         
         # Process agent neighbors
         agent_attended = self._attend_to_agents(
@@ -184,10 +199,14 @@ class PGATCrossAttentionLayer(nn.Module):
         
         if k_neighbors == 0:
             return torch.zeros(n_agents, C, device=self.device)
+
+        # Reshape to process all neighbors at once: [n_agents * k_neighbors, feature_dim]
+        agent_key_flat = agent_key_features.reshape(-1, agent_key_features.shape[-1])
+        agent_value_flat = agent_value_features.reshape(-1, agent_value_features.shape[-1])
         
         # Transform keys and values
-        agent_keys = self.lin_agent_key(agent_key_features).view(n_agents, k_neighbors, H, C)
-        agent_values = self.lin_agent_value(agent_value_features).view(n_agents, k_neighbors, H, C)
+        agent_keys = self.lin_agent_key(agent_key_flat).reshape(n_agents, k_neighbors, H, C)
+        agent_values = self.lin_agent_value(agent_value_flat).reshape(n_agents, k_neighbors, H, C)
         
         # Calculate distance-based attention weights
         # agent_positions: [n_agents, 2], neighbor_positions: [n_agents, k_neighbors, 2]
@@ -216,7 +235,7 @@ class PGATCrossAttentionLayer(nn.Module):
         attended = torch.einsum('nhk,nkhc->nhc', attention_weights, agent_values)  # [n_agents, H, C]
         
         # Project and aggregate across heads
-        attended = attended.view(n_agents, -1)
+        attended = attended.reshape(n_agents, -1)
 
         return self.agent_proj(attended)
     
@@ -230,8 +249,8 @@ class PGATCrossAttentionLayer(nn.Module):
             return torch.zeros(n_agents, C, device=self.device)
         
         # Transform keys and values
-        obstacle_keys = self.lin_obstacle_key(obstacle_key_features).view(n_agents, k_obstacles, H, C)
-        obstacle_values = self.lin_obstacle_value(obstacle_value_features).view(n_agents, k_obstacles, H, C)
+        obstacle_keys = self.lin_obstacle_key(obstacle_key_features).reshape(n_agents, k_obstacles, H, C)
+        obstacle_values = self.lin_obstacle_value(obstacle_value_features).reshape(n_agents, k_obstacles, H, C)
         
         # Calculate distance-based attention weights
         distances = torch.norm(
@@ -255,7 +274,7 @@ class PGATCrossAttentionLayer(nn.Module):
         attended = torch.einsum('nhk,nkhc->nhc', attention_weights, obstacle_values)  # [n_agents, H, C]
         
         # Project and aggregate across heads
-        attended = attended.view(n_agents, -1)  # [n_agents, H*C]
+        attended = attended.reshape(n_agents, -1)  # [n_agents, H*C]
 
         return self.obstacle_proj(attended)
 
@@ -287,10 +306,10 @@ class PGATActor(nn.Module):
         
         # Calculate dimensions
         self.query_dim = self._calculate_feature_dim(obs_config.get_agent_query_indices())
-        self.agent_key_dim = self._calculate_feature_dim(obs_config.get_neighbor_key_indices())
-        self.agent_value_dim = self._calculate_feature_dim(obs_config.get_neighbor_value_indices())
-        self.obstacle_key_dim = self._calculate_feature_dim(obs_config.get_obstacle_key_indices())
-        self.obstacle_value_dim = self._calculate_feature_dim(obs_config.get_obstacle_value_indices())
+        self.agent_key_dim = obs_config.get_neighbor_key_dim()      # Now correctly 6
+        self.agent_value_dim = obs_config.get_neighbor_value_dim()  # Now correctly 7
+        self.obstacle_key_dim = obs_config.get_obstacle_key_dim()
+        self.obstacle_value_dim = obs_config.get_obstacle_value_dim()
         
         # Build PGAT layers
         self.pgat_layers = nn.ModuleList()
@@ -368,10 +387,10 @@ class PGATActor(nn.Module):
         obstacle_values_raw = self._extract_features_from_obs(obs, self.obs_config.get_obstacle_value_indices())
         
         # Reshape to separate individual neighbors/obstacles
-        agent_key_features = neighbor_keys_raw.view(batch_size, self.k_neighbors, -1)
-        agent_value_features = neighbor_values_raw.view(batch_size, self.k_neighbors, -1)
-        obstacle_key_features = obstacle_keys_raw.view(batch_size, self.k_obstacles, -1) 
-        obstacle_value_features = obstacle_values_raw.view(batch_size, self.k_obstacles, -1)
+        agent_key_features = neighbor_keys_raw.reshape(batch_size, self.k_neighbors, -1)
+        agent_value_features = neighbor_values_raw.reshape(batch_size, self.k_neighbors, -1)
+        obstacle_key_features = obstacle_keys_raw.reshape(batch_size, self.k_obstacles, -1) 
+        obstacle_value_features = obstacle_values_raw.reshape(batch_size, self.k_obstacles, -1)
         
         return agent_key_features, agent_value_features, obstacle_key_features, obstacle_value_features
 
@@ -384,12 +403,12 @@ class PGATActor(nn.Module):
         
         # Extract neighbor positions from the neighbor block
         neighbor_block = obs[:, self.obs_config.neighbor_block_idx]  
-        neighbor_block = neighbor_block.view(batch_size, self.k_neighbors, self.obs_config.neighbor_obs_dim)  
+        neighbor_block = neighbor_block.reshape(batch_size, self.k_neighbors, self.obs_config.neighbor_obs_dim)  
         neighbor_positions = neighbor_block[:, :, :2]  # Assuming first 2 are positions
         
         # Extract obstacle positions
         obstacle_block = obs[:, self.obs_config.obstacle_block_idx]  
-        obstacle_positions = obstacle_block.view(batch_size, self.k_obstacles, 2)  
+        obstacle_positions = obstacle_block.reshape(batch_size, self.k_obstacles, 2)  
         
         return agent_positions, neighbor_positions, obstacle_positions
         
@@ -456,6 +475,6 @@ class PGATActor(nn.Module):
         # Apply output MLP
         agent_outputs = self.output_mlp(x)
         
-        return agent_outputs.view(batch_size, n_agents, -1)
+        return agent_outputs.reshape(batch_size, n_agents, -1)
 
 
