@@ -30,8 +30,8 @@ buffer:
   memory_size: ???
 
 loss:
-  gamma: 0.9
-  lmbda: 0.9
+  gamma: 0.995
+  lmbda: 0.95
   entropy_eps: 0
   clip_epsilon: 0.2
 

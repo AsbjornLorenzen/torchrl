@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 from torch_geometric.nn import GATConv, GATv2Conv
@@ -6,6 +7,76 @@ from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import softmax
 import torch.nn.functional as F
 from typing import Optional, Tuple
+
+
+class ObservationConfig:
+    """Configuration class to define how to extract Q/K/V from observations"""
+    def __init__(self):
+        # Define observation structure indices
+        # These should be configured based on your specific observation space
+        
+        # Current agent observation indices
+        self.agent_position_idx = slice(0, 2)          # [x, y] position
+        self.agent_velocity_idx = slice(2, 4)          # [vx, vy] velocity
+        self.formation_vector_idx = slice(4, 6)        # vector to nearest formation point
+        self.formation_progress_idx = slice(6, 9)      # progress in last few steps [3 timesteps]
+        self.formation_error_idx = slice(9, 10)        # current formation error
+        
+        # Neighbor agent observation indices (per neighbor)
+        self.neighbor_position_idx = slice(0, 2)       # relative position to neighbor
+        self.neighbor_velocity_idx = slice(2, 4)       # neighbor's velocity
+        self.neighbor_formation_role_idx = slice(4, 5) # neighbor's formation role/ID
+        self.neighbor_distance_idx = slice(5, 6)       # distance to neighbor
+        self.neighbor_formation_progress_idx = slice(6, 9)  # neighbor's formation progress
+        
+        # Obstacle observation indices (per obstacle)
+        self.obstacle_position_idx = slice(0, 2)       # relative position to obstacle
+        self.obstacle_size_idx = slice(2, 3)           # obstacle size/radius
+        self.obstacle_distance_idx = slice(3, 4)       # distance to obstacle
+        self.obstacle_urgency_idx = slice(4, 5)        # avoidance urgency
+        
+    def get_agent_query_indices(self) -> List[slice]:
+        """Define which parts of agent observation to use for Query"""
+        return [
+            self.agent_position_idx,
+            self.agent_velocity_idx,
+            self.formation_vector_idx,
+            self.formation_progress_idx
+        ]
+    
+    def get_neighbor_key_indices(self) -> List[slice]:
+        """Define which parts of neighbor observation to use for Key"""
+        return [
+            self.neighbor_position_idx,
+            self.neighbor_velocity_idx,
+            self.neighbor_distance_idx
+        ]
+    
+    def get_neighbor_value_indices(self) -> List[slice]:
+        """Define which parts of neighbor observation to use for Value"""
+        return [
+            self.neighbor_position_idx,
+            self.neighbor_velocity_idx,
+            self.neighbor_formation_role_idx,
+            self.neighbor_formation_progress_idx
+        ]
+    
+    def get_obstacle_key_indices(self) -> List[slice]:
+        """Define which parts of obstacle observation to use for Key"""
+        return [
+            self.obstacle_position_idx,
+            self.obstacle_size_idx,
+            self.obstacle_distance_idx
+        ]
+    
+    def get_obstacle_value_indices(self) -> List[slice]:
+        """Define which parts of obstacle observation to use for Value"""
+        return [
+            self.obstacle_position_idx,
+            self.obstacle_size_idx,
+            self.obstacle_urgency_idx
+        ]
+
 
 
 class PositionAwareGATLayer(MessagePassing):
