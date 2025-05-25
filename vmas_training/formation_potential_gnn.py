@@ -8,7 +8,7 @@ import time
 import os
 import hydra
 import torch
-import datetime
+from datetime import datetime
 
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
