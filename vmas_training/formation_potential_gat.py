@@ -273,7 +273,9 @@ def train(cfg: "DictConfig"):  # noqa: F821
         critic_network=value_module,
         clip_epsilon=cfg.loss.clip_epsilon,
         entropy_coef=cfg.loss.entropy_eps,
-        normalize_advantage=False,
+        normalize_advantage=True,
+        clip_value=True,
+        value_target_clipping=0.2,
     )
     loss_module.set_keys(
         reward=env.reward_key,
@@ -286,6 +288,12 @@ def train(cfg: "DictConfig"):  # noqa: F821
         ValueEstimators.GAE, gamma=cfg.loss.gamma, lmbda=cfg.loss.lmbda
     )
     optim = torch.optim.Adam(loss_module.parameters(), cfg.train.lr)
+    scheduler = torch.optim.lr_scheduler.LinearLR(
+        optim, 
+        start_factor=1.0, 
+        end_factor=0.1, 
+        total_iters=cfg.collector.n_iters
+    )
 
     # Logging
     if cfg.logger.backend:
@@ -365,10 +373,22 @@ def train(cfg: "DictConfig"):  # noqa: F821
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     loss_module.parameters(), cfg.train.max_grad_norm
                 )
+
+                # Add separate clipping for actor and critic
+                actor_norm = torch.nn.utils.clip_grad_norm_(
+                    loss_module.actor_network.parameters(), cfg.train.max_grad_norm * 0.5
+                )
+                critic_norm = torch.nn.utils.clip_grad_norm_(
+                    loss_module.critic_network.parameters(), cfg.train.max_grad_norm * 0.5
+                )
+
                 training_tds[-1].set("grad_norm", total_norm.mean())
+                training_tds[-1].set("actor_grad_norm", actor_norm.mean())
+                training_tds[-1].set("critic_grad_norm", critic_norm.mean())
 
                 optim.step()
                 optim.zero_grad()
+                scheduler.step()
 
         collector.update_policy_weights_()
 
