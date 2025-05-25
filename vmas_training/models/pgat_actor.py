@@ -93,6 +93,14 @@ class ObservationConfig:
             self.ego_agent_ideal_dist_idx,
             self.ego_goal_vector_idx
         ]
+
+    def get_new_query_indices(self) -> List[slice]:
+        """Return indices for reference point features"""
+        return [
+            self.ego_formation_vector_idx,
+            # self.ego_vel_to_form_idx,
+            # self.ego_progress_idx
+        ]
     
     def get_query_dim(self) -> int:
         """Get dimension for query (ego agent position)"""
@@ -325,8 +333,8 @@ class PGATActor(nn.Module):
         obs_config: ObservationConfig,
         total_obs_dim: int,
         n_agent_outputs: int,
-        gnn_hidden_dim: int = 128,
-        n_gnn_layers: int = 2,
+        gnn_hidden_dim: int = 256,
+        n_gnn_layers: int = 1,
         n_attention_heads: int = 4,
         k_neighbors: Optional[int] = None,
         k_obstacles: Optional[int] = None,
@@ -483,6 +491,7 @@ class PGATActor(nn.Module):
         obstacle_value_features = obstacle_positions - ego_positions.unsqueeze(1)  # [batch, k_obstacles, 2]
         
         return obstacle_key_features, obstacle_value_features, obstacle_positions
+
         
     def forward(self, agent_observations: torch.Tensor) -> torch.Tensor:
         """
@@ -499,7 +508,9 @@ class PGATActor(nn.Module):
         x_flat = obs.reshape(batch_size * n_agents, -1)
         
         # Extract query features (ego agent position)
-        query_input_L0 = self._extract_features_from_obs(x_flat, self.obs_config.get_agent_query_indices())
+        # query_input_L0 = self._extract_features_from_obs(x_flat, self.obs_config.get_agent_query_indices())
+        # TEST: Try using vec to formation as query
+        query_input_L0 = self._extract_features_from_obs(x_flat, self.obs_config.get_new_query_indices())
         
         # Extract ego positions
         ego_positions = x_flat[:, self.obs_config.ego_agent_position_idx]  # [batch_size * n_agents, 2]
