@@ -26,7 +26,8 @@ from torchrl.modules.models.multiagent import MultiAgentMLP
 from torchrl.objectives import ClipPPOLoss, ValueEstimators
 from utils.logging import init_logging, log_evaluation, log_training
 from utils.utils import DoneTransform
-from models.gat_actor import PGATActor, ObservationConfig
+# from models.gat_actor import GATActor, ObservationConfig
+from models.pgat_actor import PGATActor, ObservationConfig
 from models.gnn_critic import GNNCritic
 
 

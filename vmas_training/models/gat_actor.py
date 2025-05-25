@@ -278,7 +278,7 @@ class PGATCrossAttentionLayer(nn.Module):
 
         return self.obstacle_proj(attended)
 
-class PGATActor(nn.Module):
+class GATActor(nn.Module):
     def __init__(
         self,
         obs_config: ObservationConfig,
