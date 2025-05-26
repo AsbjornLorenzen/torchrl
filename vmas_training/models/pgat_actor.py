@@ -167,11 +167,12 @@ class PGATCrossAttentionLayer(nn.Module):
         self.device = device if device is not None else torch.device('cpu')
         
         # Distance-based attention decay coefficients (learnable parameters)
-        self.c_agent_decay = nn.Parameter(torch.tensor(c_agent_decay, device=self.device).clamp(min=0.1))
+        self.register_parameter('c_agent_decay', nn.Parameter(torch.tensor(c_agent_decay).clamp(min=0.1)))
+
         self.c_obstacle_decay = nn.Parameter(torch.tensor(c_obstacle_decay, device=self.device).clamp(min=0.1))
         
         # Linear transformations for Query
-        self.lin_query = nn.Linear(query_dim, heads * out_channels, bias=True, device=self.device)
+        self.lin_query = nn.Linear(query_dim, heads * out_channels, bias=True)
         
         # Separate linear transformations for agent neighbors
         self.lin_agent_key = nn.Linear(agent_key_dim, heads * out_channels, bias=True, device=self.device)
@@ -241,8 +242,9 @@ class PGATCrossAttentionLayer(nn.Module):
         n_agents, k_neighbors = agent_key_features.shape[:2]
         H, C = self.heads, self.out_channels
         
+        device = query.device
         if k_neighbors == 0:
-            return torch.zeros(n_agents, C, device=self.device)
+            return torch.zeros(n_agents, C, device=device)
 
         # Reshape to process all neighbors at once: [n_agents * k_neighbors, feature_dim]
         agent_key_flat = agent_key_features.reshape(-1, agent_key_features.shape[-1])
@@ -435,7 +437,7 @@ class PGATActor(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(256, n_agent_outputs)
-        ).to(self.device)
+        )
 
         # Residual baseline network (outputs a baseline "always cooperate" signal)
         if self.use_residual_baseline:
@@ -551,7 +553,8 @@ class PGATActor(nn.Module):
         """
         batch_size, n_agents = agent_observations.shape[0], agent_observations.shape[1]
         
-        obs = agent_observations.to(dtype=torch.float32, device=self.device)
+        device = agent_observations.device
+        obs = agent_observations.to(dtype=torch.float32, device=device)
         
         if batch_size == 0 or n_agents == 0:
             return torch.zeros(batch_size, n_agents, self.n_agent_outputs, device=self.device)

@@ -44,7 +44,7 @@ train:
   device: ???
 
 eval:
-  evaluation_interval: 10
+  evaluation_interval: 1
   evaluation_episodes: 20
 
 logger:

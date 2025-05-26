@@ -211,6 +211,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         ),
         NormalParamExtractor(),
     )
+    actor_net = actor_net.to(cfg.train.device)
 
     policy_module = TensorDictModule(
         actor_net,
@@ -228,7 +229,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         distribution_class=TanhNormal,
         distribution_kwargs={
             "low": lowest_action,
-            "high": env.full_action_spec_unbatched[("agents", "action")].space.high,
+            "high": env.full_action_spec_unbatched[("agents", "action")].space.high.to(cfg.train.device),
         },
         return_log_prob=True,
     )
