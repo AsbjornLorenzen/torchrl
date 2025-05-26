@@ -341,6 +341,9 @@ class PGATActor(nn.Module):
         dropout: float = 0.0,
         pos_indices: slice = slice(0, 2),
         device=None,
+        init_bias_value: float = 2.0,  # Bias the output towards higher values
+        temporal_smoothing: float = 0.1,  # Momentum for temporal consistency
+        use_residual_baseline: bool = True,  # Add residual connection for baseline behavior
     ):
         super().__init__()
         
@@ -353,6 +356,12 @@ class PGATActor(nn.Module):
         self.device = device if device is not None else torch.device('cpu')
         self.n_gnn_layers = n_gnn_layers
         self.gnn_hidden_dim = gnn_hidden_dim
+
+        # Try to fix stability with these:
+        self.init_bias_value = init_bias_value
+        self.temporal_smoothing = temporal_smoothing
+        self.use_residual_baseline = use_residual_baseline
+        self.register_buffer('prev_output', None)
         
         # Calculate dimensions from ObservationConfig
         self.query_dim = obs_config.get_query_dim()  # 2 for ego position
@@ -427,6 +436,49 @@ class PGATActor(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(256, n_agent_outputs)
         ).to(self.device)
+
+        # Residual baseline network (outputs a baseline "always cooperate" signal)
+        if self.use_residual_baseline:
+            self.baseline_mlp = nn.Sequential(
+                nn.Linear(self.other_ego_feature_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, n_agent_outputs)
+            ).to(self.device)
+            
+            # Initialize baseline to output moderate positive values
+            with torch.no_grad():
+                self.baseline_mlp[-1].bias.fill_(1.0)  # Bias towards outputting ~1
+                self.baseline_mlp[-1].weight.fill_(0.1)  # Small weights so it's learnable
+        
+        # Gating mechanism to control baseline vs learned behavior
+        if self.use_residual_baseline:
+            self.gate_mlp = nn.Sequential(
+                nn.Linear(output_mlp_input_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, n_agent_outputs),
+                nn.Sigmoid()  # Gate values between 0 and 1
+            ).to(self.device)
+        
+        # Initialize the network
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Custom weight initialization to bias towards higher outputs"""
+        
+        # Initialize final layer of main MLP to output higher values
+        with torch.no_grad():
+            # Set bias to positive values to encourage higher outputs
+            self.output_mlp[-1].bias.fill_(self.init_bias_value)
+            
+            # Initialize weights with smaller variance to make outputs more stable
+            nn.init.normal_(self.output_mlp[-1].weight, mean=0.0, std=0.1)
+        
+        # Initialize gate network to initially favor baseline behavior
+        if self.use_residual_baseline:
+            with torch.no_grad():
+                # Start with gate mostly closed (favor baseline)
+                self.gate_mlp[-2].bias.fill_(-1.0)  # This will make sigmoid output ~0.27
+
         
     def _calculate_feature_dim(self, slice_list: List[slice]) -> int:
         """Calculate total dimension from list of slices"""
@@ -577,11 +629,38 @@ class PGATActor(nn.Module):
         
         # Concatenate with other ego features
         final_features = torch.cat([combined_gat_output, other_ego_features_input], dim=-1)
+
+        # BEGIN NEW APPROACH 
+        # Main network output
+        main_output = self.output_mlp(final_features)
         
-        # Apply output MLP
-        agent_outputs = self.output_mlp(final_features)
+        if self.use_residual_baseline:
+            # Baseline output (simple heuristic behavior)
+            baseline_output = self.baseline_mlp(other_ego_features_input)
+            
+            # Gating mechanism
+            gate = self.gate_mlp(final_features)
+            
+            # Combine main output and baseline
+            agent_outputs = gate * main_output + (1 - gate) * baseline_output
+        else:
+            agent_outputs = main_output
         
-        # Reshape back to batch format
+        # Apply sigmoid to ensure outputs are in [0, 1]
+        agent_outputs = torch.sigmoid(agent_outputs)
+        
+        # Temporal smoothing for consistency
+        if self.training and self.prev_output is not None and self.temporal_smoothing > 0:
+            if self.prev_output.shape == agent_outputs.shape:
+                agent_outputs = (1 - self.temporal_smoothing) * agent_outputs + self.temporal_smoothing * self.prev_output
+        
+        # Store current output for next step
+        if self.training:
+            self.prev_output = agent_outputs.detach().clone()
+        
         return agent_outputs.reshape(batch_size, n_agents, -1)
 
+        # OLD APPROACH:
+        # Apply output MLP
+        # agent_outputs = self.output_mlp(final_features)
 
