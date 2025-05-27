@@ -343,9 +343,7 @@ class PGATActor(nn.Module):
         dropout: float = 0.0,
         pos_indices: slice = slice(0, 2),
         device=None,
-        init_bias_value: float = 2.0,  # Bias the output towards higher values
-        temporal_smoothing: float = 0.1,  # Momentum for temporal consistency
-        use_residual_baseline: bool = True,  # Add residual connection for baseline behavior
+        init_bias_value: float = 0.0,  # Bias the output towards higher values
     ):
         super().__init__()
         
@@ -361,8 +359,6 @@ class PGATActor(nn.Module):
 
         # Try to fix stability with these:
         self.init_bias_value = init_bias_value
-        self.temporal_smoothing = temporal_smoothing
-        self.use_residual_baseline = use_residual_baseline
         self.register_buffer('prev_output', None)
         
         # Calculate dimensions from ObservationConfig
@@ -439,30 +435,8 @@ class PGATActor(nn.Module):
             nn.Linear(256, n_agent_outputs)
         )
 
-        # Residual baseline network (outputs a baseline "always cooperate" signal)
-        if self.use_residual_baseline:
-            self.baseline_mlp = nn.Sequential(
-                nn.Linear(self.other_ego_feature_dim, 64),
-                nn.ReLU(),
-                nn.Linear(64, n_agent_outputs)
-            ).to(self.device)
-            
-            # Initialize baseline to output moderate positive values
-            with torch.no_grad():
-                self.baseline_mlp[-1].bias.fill_(1.0)  # Bias towards outputting ~1
-                self.baseline_mlp[-1].weight.fill_(0.1)  # Small weights so it's learnable
-        
-        # Gating mechanism to control baseline vs learned behavior
-        if self.use_residual_baseline:
-            self.gate_mlp = nn.Sequential(
-                nn.Linear(output_mlp_input_dim, 64),
-                nn.ReLU(),
-                nn.Linear(64, n_agent_outputs),
-                nn.Sigmoid()  # Gate values between 0 and 1
-            ).to(self.device)
-        
         # Initialize the network
-        self._initialize_weights()
+        # self._initialize_weights()
 
     def _initialize_weights(self):
         """Custom weight initialization to bias towards higher outputs"""
@@ -652,14 +626,6 @@ class PGATActor(nn.Module):
         # Apply sigmoid to ensure outputs are in [0, 1]
         agent_outputs = torch.sigmoid(agent_outputs)
         
-        # Temporal smoothing for consistency
-        if self.training and self.prev_output is not None and self.temporal_smoothing > 0:
-            if self.prev_output.shape == agent_outputs.shape:
-                agent_outputs = (1 - self.temporal_smoothing) * agent_outputs + self.temporal_smoothing * self.prev_output
-        
-        # Store current output for next step
-        if self.training:
-            self.prev_output = agent_outputs.detach().clone()
         
         return agent_outputs.reshape(batch_size, n_agents, -1)
 

@@ -23,7 +23,7 @@ model:
   centralised_critic: True  # MAPPO if True, IPPO if False
 
 collector:
-  frames_per_batch: 6_000 # Frames sampled each sampling iteration
+  frames_per_batch: 24_000 # Frames sampled each sampling iteration
   n_iters: 500 # Number of sampling/training iterations
   total_frames: ???
 
@@ -39,12 +39,12 @@ loss:
 train:
   num_epochs: 10  # optimization steps per batch of data collected
   minibatch_size: 100 # size of minibatches used in each epoch
-  lr: 1e-4
+  lr: 1e-6
   max_grad_norm: 0.5
   device: ???
 
 eval:
-  evaluation_interval: 1
+  evaluation_interval: 10
   evaluation_episodes: 20
 
 logger:

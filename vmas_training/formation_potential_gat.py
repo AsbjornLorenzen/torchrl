@@ -220,6 +220,8 @@ def train(cfg: "DictConfig"):  # noqa: F821
     )
 
     lowest_action = torch.zeros_like(env.full_action_spec_unbatched[("agents", "action")].space.low, device=cfg.train.device)
+    highest_action = env.full_action_spec_unbatched[("agents", "action")].space.high.to(cfg.train.device)
+    print(f"Got action spec lowest {lowest_action} highest {highest_action}")
 
     policy = ProbabilisticActor(
         module=policy_module,
@@ -229,7 +231,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         distribution_class=TanhNormal,
         distribution_kwargs={
             "low": lowest_action,
-            "high": env.full_action_spec_unbatched[("agents", "action")].space.high.to(cfg.train.device),
+            "high": highest_action
         },
         return_log_prob=True,
     )
