@@ -127,6 +127,36 @@ def save_model_snapshot(policy, value_module, iteration, metrics=None):
     
     return save_path
 
+def monitor_action_distribution(tensordict_data, iteration):
+    """Monitor action distribution to ensure proper exploration"""
+    actions = tensordict_data["agents"]["action"]
+    
+    # Flatten actions across all agents and environments
+    actions_flat = actions.reshape(-1, actions.shape[-1])
+    
+    action_stats = {
+        'action_mean': actions_flat.mean(dim=0),
+        'action_std': actions_flat.std(dim=0),
+        'action_min': actions_flat.min(dim=0)[0],
+        'action_max': actions_flat.max(dim=0)[0],
+        'action_range': actions_flat.max(dim=0)[0] - actions_flat.min(dim=0)[0]
+    }
+    
+    print(f"\nIteration {iteration} Action Statistics:")
+    print(f"  Mean: {action_stats['action_mean']}")
+    print(f"  Std:  {action_stats['action_std']}")
+    print(f"  Min:  {action_stats['action_min']}")
+    print(f"  Max:  {action_stats['action_max']}")
+    print(f"  Range: {action_stats['action_range']}")
+    
+    # Check if actions are stuck at boundaries
+    boundary_threshold = 0.95
+    high_boundary_ratio = (actions_flat > boundary_threshold).float().mean()
+    low_boundary_ratio = (actions_flat < -boundary_threshold).float().mean()
+    
+    print(f"  Actions near +1: {high_boundary_ratio:.3f}")
+    print(f"  Actions near -1: {low_boundary_ratio:.3f}")
+
 @hydra.main(version_base="1.1", config_path="", config_name="mappo_gat")
 def train(cfg: "DictConfig"):  # noqa: F821
     # Handle run description - priority: CLI override > env var > default
@@ -219,7 +249,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         out_keys=[("agents", "loc"), ("agents", "scale")],
     )
 
-    lowest_action = torch.zeros_like(env.full_action_spec_unbatched[("agents", "action")].space.low, device=cfg.train.device)
+    lowest_action = env.full_action_spec_unbatched[("agents", "action")].space.low.to(cfg.train.device)
     highest_action = env.full_action_spec_unbatched[("agents", "action")].space.high.to(cfg.train.device)
     print(f"Got action spec lowest {lowest_action} highest {highest_action}")
 
@@ -318,6 +348,8 @@ def train(cfg: "DictConfig"):  # noqa: F821
         # Extract episode metrics
         with torch.no_grad():
             training_episode_metrics = extract_episode_metrics(tensordict_data, env)
+
+        monitor_action_distribution(tensordict_data, i)
 
         # Log training episode metrics
         if cfg.logger.backend:

@@ -81,6 +81,15 @@ class ObservationConfig:
             self.ego_vel_to_form_idx,
             self.ego_progress_idx
         ]
+
+    def get_ego_grad_feature_indices(self) -> List[slice]:
+        """Return indices to gradients"""
+        return [
+            self.ego_grad_agents_idx,
+            self.ego_grad_vol_idx,
+            self.ego_grad_obs_idx,
+            self.ego_grad_form_idx,
+        ]
     
     def get_other_ego_feature_indices(self) -> List[slice]:
         """Return indices for other ego-agent features"""
@@ -97,14 +106,21 @@ class ObservationConfig:
     def get_new_query_indices(self) -> List[slice]:
         """Return indices for reference point features"""
         return [
+            self.ego_agent_position_idx,
+            self.ego_agent_velocity_idx,
             self.ego_formation_vector_idx,
-            # self.ego_vel_to_form_idx,
-            # self.ego_progress_idx
+            self.ego_agent_ideal_dist_idx,
+            self.ego_goal_vector_idx,
+            self.ego_vel_to_form_idx,
+            self.ego_progress_idx,
         ]
-    
+
     def get_query_dim(self) -> int:
         """Get dimension for query (ego agent position)"""
-        return 2
+        return 11
+
+    def get_grad_feature_dim(self) -> int:
+        return 8
     
     def get_neighbor_key_dim(self) -> int:
         """Get dimension for neighbor keys (positions)"""
@@ -368,7 +384,7 @@ class PGATActor(nn.Module):
         self.obstacle_key_dim = obs_config.get_obstacle_key_dim()  # 2 for obstacle positions
         self.obstacle_value_dim = obs_config.get_obstacle_value_dim()  # 2 for obstacle relative positions
         self.ref_point_feature_dim = obs_config.get_reference_point_feature_dim()  # 4
-        self.other_ego_feature_dim = obs_config.get_other_ego_feature_dim()  # 13
+        self.other_ego_feature_dim = obs_config.get_grad_feature_dim()  # 8
         
         # Build PGAT layers
         self.pgat_layers = nn.ModuleList()
@@ -423,6 +439,7 @@ class PGATActor(nn.Module):
         # Input: agent_attended + obstacle_attended + ref_point_features + other_ego_features
         # = gnn_hidden_dim + gnn_hidden_dim + gnn_hidden_dim + other_ego_feature_dim
         # = 3 * gnn_hidden_dim + other_ego_feature_dim
+        # TODO: FIX DIM
         output_mlp_input_dim = 3 * gnn_hidden_dim + self.other_ego_feature_dim
         
         self.output_mlp = nn.Sequential(
@@ -554,7 +571,8 @@ class PGATActor(nn.Module):
         ref_point_features_input = self._extract_features_from_obs(x_flat, self.obs_config.get_reference_point_feature_indices())
         
         # Extract other ego features
-        other_ego_features_input = self._extract_features_from_obs(x_flat, self.obs_config.get_other_ego_feature_indices())
+        # other_ego_features_input = self._extract_features_from_obs(x_flat, self.obs_config.get_other_ego_feature_indices())
+        grad_ego_features_input = self._extract_features_from_obs(x_flat, self.obs_config.get_ego_grad_feature_indices())
         
         # Process reference point features through MLP (once, outside the loop)
         processed_ref_point_features = self.ref_point_mlp(ref_point_features_input)  # [batch_size * n_agents, gnn_hidden_dim]
@@ -605,27 +623,23 @@ class PGATActor(nn.Module):
         combined_gat_output = F.dropout(combined_gat_output, p=0.1, training=self.training)
         
         # Concatenate with other ego features
-        final_features = torch.cat([combined_gat_output, other_ego_features_input], dim=-1)
+        final_features = torch.cat([combined_gat_output, grad_ego_features_input], dim=-1)
 
         # BEGIN NEW APPROACH 
         # Main network output
         main_output = self.output_mlp(final_features)
         
-        if self.use_residual_baseline:
-            # Baseline output (simple heuristic behavior)
-            baseline_output = self.baseline_mlp(other_ego_features_input)
-            
-            # Gating mechanism
-            gate = self.gate_mlp(final_features)
-            
-            # Combine main output and baseline
-            agent_outputs = gate * main_output + (1 - gate) * baseline_output
-        else:
-            agent_outputs = main_output
-        
-        # Apply sigmoid to ensure outputs are in [0, 1]
-        agent_outputs = torch.sigmoid(agent_outputs)
-        
+        # if self.use_residual_baseline:
+        #     # Baseline output (simple heuristic behavior)
+        #     baseline_output = self.baseline_mlp(grad_ego_features_input)
+        #     
+        #     # Gating mechanism
+        #     gate = self.gate_mlp(final_features)
+        #     
+        #     # Combine main output and baseline
+        #     agent_outputs = gate * main_output + (1 - gate) * baseline_output
+        # else:
+        agent_outputs = main_output
         
         return agent_outputs.reshape(batch_size, n_agents, -1)
 
