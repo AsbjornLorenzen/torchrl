@@ -94,30 +94,33 @@ class ObservationConfig:
     def get_other_ego_feature_indices(self) -> List[slice]:
         """Return indices for other ego-agent features"""
         return [
-            self.ego_agent_velocity_idx,
+            # self.ego_agent_velocity_idx,
             self.ego_grad_agents_idx,
             self.ego_grad_vol_idx,
             self.ego_grad_obs_idx,
             self.ego_grad_form_idx,
             self.ego_agent_ideal_dist_idx,
-            self.ego_goal_vector_idx
+            # self.ego_goal_vector_idx,
+            self.ego_vel_to_form_idx,
+            self.ego_progress_idx,
         ]
 
     def get_new_query_indices(self) -> List[slice]:
         """Return indices for reference point features"""
         return [
-            self.ego_agent_position_idx,
+            # self.ego_agent_position_idx,
             self.ego_agent_velocity_idx,
             self.ego_formation_vector_idx,
-            self.ego_agent_ideal_dist_idx,
-            self.ego_goal_vector_idx,
-            self.ego_vel_to_form_idx,
-            self.ego_progress_idx,
+            # self.ego_agent_ideal_dist_idx,
+            # self.ego_goal_vector_idx,
+            # self.ego_vel_to_form_idx,
+            # self.ego_progress_idx,
         ]
 
     def get_query_dim(self) -> int:
         """Get dimension for query (ego agent position)"""
-        return 11
+        # return 11
+        return 4
 
     def get_grad_feature_dim(self) -> int:
         return 8
@@ -146,9 +149,9 @@ class ObservationConfig:
     
     def get_other_ego_feature_dim(self) -> int:
         """Get dimension for other ego features"""
-        # velocity(2) + grad_agents(2) + grad_vol(2) + grad_obs(2) + 
+        # grad_agents(2) + grad_vol(2) + grad_obs(2) + 
         # grad_form(2) + ideal_dist(1) + goal_vector(2) = 13
-        return 13
+        return 11
 
 
 class PGATCrossAttentionLayer(nn.Module):
@@ -384,7 +387,7 @@ class PGATActor(nn.Module):
         self.obstacle_key_dim = obs_config.get_obstacle_key_dim()  # 2 for obstacle positions
         self.obstacle_value_dim = obs_config.get_obstacle_value_dim()  # 2 for obstacle relative positions
         self.ref_point_feature_dim = obs_config.get_reference_point_feature_dim()  # 4
-        self.other_ego_feature_dim = obs_config.get_grad_feature_dim()  # 8
+        self.other_ego_feature_dim = obs_config.get_other_ego_feature_dim()  # 13
         
         # Build PGAT layers
         self.pgat_layers = nn.ModuleList()
@@ -430,7 +433,7 @@ class PGATActor(nn.Module):
         if n_gnn_layers > 1:
             # Projects concatenated [agent_attended, obstacle_attended, ref_point_features] back to gnn_hidden_dim
             self.multi_layer_query_proj = nn.Sequential(
-                nn.Linear(3 * gnn_hidden_dim, 2 * gnn_hidden_dim),
+                nn.Linear(2 * gnn_hidden_dim, 2 * gnn_hidden_dim),
                 nn.ReLU(),
                 nn.Linear(2 * gnn_hidden_dim, gnn_hidden_dim)
             )
@@ -440,20 +443,20 @@ class PGATActor(nn.Module):
         # = gnn_hidden_dim + gnn_hidden_dim + gnn_hidden_dim + other_ego_feature_dim
         # = 3 * gnn_hidden_dim + other_ego_feature_dim
         # TODO: FIX DIM
-        output_mlp_input_dim = 3 * gnn_hidden_dim + self.other_ego_feature_dim
+        output_mlp_input_dim = 2 * gnn_hidden_dim + self.other_ego_feature_dim
         
         self.output_mlp = nn.Sequential(
-            nn.Linear(output_mlp_input_dim, 256),
+            nn.Linear(output_mlp_input_dim, 128),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 256), 
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, n_agent_outputs)
+            # nn.Linear(256, 256), 
+            # nn.ReLU(),
+            # nn.Dropout(dropout),
+            nn.Linear(128, n_agent_outputs)
         )
 
-        # Initialize the network
-        # self._initialize_weights()
+        # Initialize the network weights
+        self._initialize_weights()
 
     def _initialize_weights(self):
         """Custom weight initialization to bias towards higher outputs"""
@@ -461,17 +464,8 @@ class PGATActor(nn.Module):
         # Initialize final layer of main MLP to output higher values
         with torch.no_grad():
             # Set bias to positive values to encourage higher outputs
-            self.output_mlp[-1].bias.fill_(self.init_bias_value)
-            
-            # Initialize weights with smaller variance to make outputs more stable
-            nn.init.normal_(self.output_mlp[-1].weight, mean=0.0, std=0.1)
-        
-        # Initialize gate network to initially favor baseline behavior
-        if self.use_residual_baseline:
-            with torch.no_grad():
-                # Start with gate mostly closed (favor baseline)
-                self.gate_mlp[-2].bias.fill_(-1.0)  # This will make sigmoid output ~0.27
-
+            # self.output_mlp[-1].bias.fill_(self.init_bias_value)
+            nn.init.normal_(self.output_mlp[-1].weight, mean=0.0, std=1.0)
         
     def _calculate_feature_dim(self, slice_list: List[slice]) -> int:
         """Calculate total dimension from list of slices"""
@@ -568,14 +562,14 @@ class PGATActor(nn.Module):
         obstacle_keys_input, obstacle_values_input, obstacle_positions = self._extract_obstacle_features(x_flat, ego_positions)
         
         # Extract reference point features
-        ref_point_features_input = self._extract_features_from_obs(x_flat, self.obs_config.get_reference_point_feature_indices())
+        # ref_point_features_input = self._extract_features_from_obs(x_flat, self.obs_config.get_reference_point_feature_indices())
         
         # Extract other ego features
-        # other_ego_features_input = self._extract_features_from_obs(x_flat, self.obs_config.get_other_ego_feature_indices())
+        other_ego_features_input = self._extract_features_from_obs(x_flat, self.obs_config.get_other_ego_feature_indices())
         grad_ego_features_input = self._extract_features_from_obs(x_flat, self.obs_config.get_ego_grad_feature_indices())
         
         # Process reference point features through MLP (once, outside the loop)
-        processed_ref_point_features = self.ref_point_mlp(ref_point_features_input)  # [batch_size * n_agents, gnn_hidden_dim]
+        # processed_ref_point_features = self.ref_point_mlp(ref_point_features_input)  # [batch_size * n_agents, gnn_hidden_dim]
         
         # GAT layer processing
         current_query = query_input_L0  # Start with ego position
@@ -604,7 +598,7 @@ class PGATActor(nn.Module):
             if i < self.n_gnn_layers - 1:
                 if self.n_gnn_layers > 1:
                     # Combine outputs with reference point features for next query
-                    combined_features = torch.cat([agent_attended, obstacle_attended, processed_ref_point_features], dim=-1)
+                    combined_features = torch.cat([agent_attended, obstacle_attended], dim=-1) # , processed_ref_point_features
                     current_query = F.relu(self.multi_layer_query_proj(combined_features))
                     current_query = F.dropout(current_query, p=0.1, training=self.training)
                 else:
@@ -615,7 +609,7 @@ class PGATActor(nn.Module):
         combined_gat_output = torch.cat([
             agent_attended_final, 
             obstacle_attended_final, 
-            processed_ref_point_features
+            # processed_ref_point_features
         ], dim=-1)  # [batch_size * n_agents, 3 * gnn_hidden_dim]
         
         # Apply ReLU and dropout
@@ -623,7 +617,7 @@ class PGATActor(nn.Module):
         combined_gat_output = F.dropout(combined_gat_output, p=0.1, training=self.training)
         
         # Concatenate with other ego features
-        final_features = torch.cat([combined_gat_output, grad_ego_features_input], dim=-1)
+        final_features = torch.cat([combined_gat_output, other_ego_features_input], dim=-1) # grad_ego_features_input
 
         # BEGIN NEW APPROACH 
         # Main network output
