@@ -85,10 +85,11 @@ class ObservationConfig:
     def get_ego_grad_feature_indices(self) -> List[slice]:
         """Return indices to gradients"""
         return [
+            # NOTE: In modified env, grad_agents is actually all grads summed
             self.ego_grad_agents_idx,
-            self.ego_grad_vol_idx,
-            self.ego_grad_obs_idx,
-            self.ego_grad_form_idx,
+            # self.ego_grad_vol_idx,
+            # self.ego_grad_obs_idx,
+            # self.ego_grad_form_idx,
         ]
     
     def get_other_ego_feature_indices(self) -> List[slice]:
@@ -96,9 +97,9 @@ class ObservationConfig:
         return [
             # self.ego_agent_velocity_idx,
             self.ego_grad_agents_idx,
-            self.ego_grad_vol_idx,
-            self.ego_grad_obs_idx,
-            self.ego_grad_form_idx,
+            # self.ego_grad_vol_idx,
+            # self.ego_grad_obs_idx,
+            # self.ego_grad_form_idx,
             self.ego_agent_ideal_dist_idx,
             # self.ego_goal_vector_idx,
             self.ego_vel_to_form_idx,
@@ -123,7 +124,7 @@ class ObservationConfig:
         return 4
 
     def get_grad_feature_dim(self) -> int:
-        return 8
+        return 2
     
     def get_neighbor_key_dim(self) -> int:
         """Get dimension for neighbor keys (positions)"""
@@ -151,7 +152,7 @@ class ObservationConfig:
         """Get dimension for other ego features"""
         # grad_agents(2) + grad_vol(2) + grad_obs(2) + 
         # grad_form(2) + ideal_dist(1) + goal_vector(2) = 13
-        return 11
+        return 5
 
 
 class PGATCrossAttentionLayer(nn.Module):
