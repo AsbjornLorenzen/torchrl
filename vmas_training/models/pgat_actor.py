@@ -97,11 +97,12 @@ class ObservationConfig:
         return [
             # self.ego_agent_velocity_idx,
             self.ego_grad_agents_idx,
-            # self.ego_grad_vol_idx,
+            self.ego_grad_vol_idx,
             # self.ego_grad_obs_idx,
             # self.ego_grad_form_idx,
-            self.ego_agent_ideal_dist_idx,
+            # self.ego_agent_ideal_dist_idx,
             # self.ego_goal_vector_idx,
+            self.ego_formation_vector_idx,
             self.ego_vel_to_form_idx,
             self.ego_progress_idx,
         ]
@@ -111,8 +112,8 @@ class ObservationConfig:
         return [
             # self.ego_agent_position_idx,
             self.ego_agent_velocity_idx,
-            self.ego_formation_vector_idx,
-            # self.ego_agent_ideal_dist_idx,
+            # self.ego_formation_vector_idx,
+            self.ego_agent_ideal_dist_idx,
             # self.ego_goal_vector_idx,
             # self.ego_vel_to_form_idx,
             # self.ego_progress_idx,
@@ -121,7 +122,7 @@ class ObservationConfig:
     def get_query_dim(self) -> int:
         """Get dimension for query (ego agent position)"""
         # return 11
-        return 4
+        return 3
 
     def get_grad_feature_dim(self) -> int:
         return 2
@@ -152,7 +153,7 @@ class ObservationConfig:
         """Get dimension for other ego features"""
         # grad_agents(2) + grad_vol(2) + grad_obs(2) + 
         # grad_form(2) + ideal_dist(1) + goal_vector(2) = 13
-        return 5
+        return 8
 
 
 class PGATCrossAttentionLayer(nn.Module):
@@ -253,6 +254,10 @@ class PGATCrossAttentionLayer(nn.Module):
             agent_positions, obstacle_positions  
         )  # [n_agents, out_channels]
         
+        if torch.any(torch.isnan(agent_attended)):
+            breakpoint()
+        if torch.any(torch.isnan(obstacle_attended)):
+            breakpoint()
         # Return both attended features separately
         return agent_attended, obstacle_attended
     
@@ -423,8 +428,8 @@ class PGATActor(nn.Module):
             self.pgat_layers.append(layer)
         
         # MLP for processing reference point features
-        self.ref_point_mlp = nn.Sequential(
-            nn.Linear(self.ref_point_feature_dim, gnn_hidden_dim),
+        self.ego_mlp = nn.Sequential(
+            nn.Linear(self.other_ego_feature_dim, gnn_hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(gnn_hidden_dim, gnn_hidden_dim)
@@ -444,7 +449,7 @@ class PGATActor(nn.Module):
         # = gnn_hidden_dim + gnn_hidden_dim + gnn_hidden_dim + other_ego_feature_dim
         # = 3 * gnn_hidden_dim + other_ego_feature_dim
         # TODO: FIX DIM
-        output_mlp_input_dim = 2 * gnn_hidden_dim + self.other_ego_feature_dim
+        output_mlp_input_dim = 3 * gnn_hidden_dim # + self.other_ego_feature_dim
         
         self.output_mlp = nn.Sequential(
             nn.Linear(output_mlp_input_dim, 128),
@@ -571,6 +576,7 @@ class PGATActor(nn.Module):
         
         # Process reference point features through MLP (once, outside the loop)
         # processed_ref_point_features = self.ref_point_mlp(ref_point_features_input)  # [batch_size * n_agents, gnn_hidden_dim]
+        processed_ego_features = self.ego_mlp(other_ego_features_input)
         
         # GAT layer processing
         current_query = query_input_L0  # Start with ego position
@@ -618,7 +624,7 @@ class PGATActor(nn.Module):
         combined_gat_output = F.dropout(combined_gat_output, p=0.1, training=self.training)
         
         # Concatenate with other ego features
-        final_features = torch.cat([combined_gat_output, other_ego_features_input], dim=-1) # grad_ego_features_input
+        final_features = torch.cat([combined_gat_output, processed_ego_features], dim=-1) # grad_ego_features_input
 
         # BEGIN NEW APPROACH 
         # Main network output
@@ -635,6 +641,8 @@ class PGATActor(nn.Module):
         #     agent_outputs = gate * main_output + (1 - gate) * baseline_output
         # else:
         agent_outputs = main_output
+        if torch.any(torch.isnan(agent_outputs)):
+            breakpoint()
         
         return agent_outputs.reshape(batch_size, n_agents, -1)
 

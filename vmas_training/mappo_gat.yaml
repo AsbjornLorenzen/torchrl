@@ -6,7 +6,7 @@ env:
   max_steps: 300
   scenario_name: "potential_formation_movement"
   scenario:
-    n_agents: 6
+    n_agents: 8
     shared_rew: True
   device: ??? # These values will be populated dynamically
   vmas_envs: ???
