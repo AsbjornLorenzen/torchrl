@@ -47,7 +47,8 @@ def extract_episode_metrics(rollouts, env):
         'avg_time_to_formation': 0,
         'formation_success_rate': 0,
         'episodes_evaluated': batch_size,
-        'avg_formation_error': 0
+        'avg_formation_error': 0,
+        'avg_best_formation_error': 0  # New metric
     }
     
     try:
@@ -77,6 +78,12 @@ def extract_episode_metrics(rollouts, env):
         metrics['avg_obstacle_collisions_per_episode'] = metrics['total_obstacle_collisions'] / batch_size
 
         metrics['avg_formation_error'] = episode_metrics['formation_accuracy_per_step'].mean().item()
+
+        formation_accuracy = episode_metrics['formation_accuracy_per_step']  # Shape: [batch_size, max_steps, ...]
+        # Take max across time steps for each batch index, then mean across batch
+        max_accuracies_per_batch = formation_accuracy.max(dim=1)[0]  # Max across time dimension
+        metrics['avg_best_formation_error'] = max_accuracies_per_batch.mean().item()
+
         
     except Exception as e:
         print(f"Warning: Could not extract episode metrics: {e}")
@@ -364,6 +371,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
                     "train/avg_time_to_formation": training_episode_metrics['avg_time_to_formation'],
                     "train/episodes_evaluated": training_episode_metrics['episodes_evaluated'],
                     "train/avg_formation_error": training_episode_metrics['avg_formation_error'],
+                    "train/avg_best_formation_error": training_episode_metrics['avg_best_formation_error'],
                 }, step=i)
             
             # Print training metrics

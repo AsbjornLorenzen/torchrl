@@ -432,6 +432,9 @@ class PGATActor(nn.Module):
             nn.Linear(self.other_ego_feature_dim, gnn_hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
+            nn.Linear(gnn_hidden_dim, gnn_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(gnn_hidden_dim, gnn_hidden_dim)
         ).to(self.device)
         
@@ -450,19 +453,33 @@ class PGATActor(nn.Module):
         # = 3 * gnn_hidden_dim + other_ego_feature_dim
         # TODO: FIX DIM
         output_mlp_input_dim = 3 * gnn_hidden_dim # + self.other_ego_feature_dim
-        
         self.output_mlp = nn.Sequential(
-            nn.Linear(output_mlp_input_dim, 128),
+            nn.Linear(output_mlp_input_dim, 2 * gnn_hidden_dim),  # 512
             nn.ReLU(),
             nn.Dropout(dropout),
-            # nn.Linear(256, 256), 
-            # nn.ReLU(),
-            # nn.Dropout(dropout),
-            nn.Linear(128, n_agent_outputs)
-        )
+            nn.Linear(2 * gnn_hidden_dim, gnn_hidden_dim),        # 256
+            nn.ReLU(), 
+            nn.Dropout(dropout),
+            nn.Linear(gnn_hidden_dim, gnn_hidden_dim // 2),       # 128
+            nn.ReLU(),
+            nn.Linear(gnn_hidden_dim // 2, n_agent_outputs)      # Final output
+        ) 
 
         # Initialize the network weights
         self._initialize_weights()
+
+        # Layer norm modules
+        self.gat_agent_norms = nn.ModuleList([
+            nn.LayerNorm(gnn_hidden_dim, device=self.device) 
+            for _ in range(n_gnn_layers)
+        ])
+        self.gat_obstacle_norms = nn.ModuleList([
+            nn.LayerNorm(gnn_hidden_dim, device=self.device) 
+            for _ in range(n_gnn_layers)
+        ])
+        self.ego_norm = nn.LayerNorm(gnn_hidden_dim, device=self.device)
+        self.combined_gat_norm = nn.LayerNorm(2 * gnn_hidden_dim, device=self.device)
+
 
     def _initialize_weights(self):
         """Custom weight initialization to bias towards higher outputs"""
@@ -471,7 +488,7 @@ class PGATActor(nn.Module):
         with torch.no_grad():
             # Set bias to positive values to encourage higher outputs
             # self.output_mlp[-1].bias.fill_(self.init_bias_value)
-            nn.init.normal_(self.output_mlp[-1].weight, mean=0.0, std=1.0)
+            nn.init.normal_(self.output_mlp[-1].weight, mean=0.0, std=0.05)
         
     def _calculate_feature_dim(self, slice_list: List[slice]) -> int:
         """Calculate total dimension from list of slices"""
@@ -577,6 +594,7 @@ class PGATActor(nn.Module):
         # Process reference point features through MLP (once, outside the loop)
         # processed_ref_point_features = self.ref_point_mlp(ref_point_features_input)  # [batch_size * n_agents, gnn_hidden_dim]
         processed_ego_features = self.ego_mlp(other_ego_features_input)
+        processed_ego_features = self.ego_norm(processed_ego_features)
         
         # GAT layer processing
         current_query = query_input_L0  # Start with ego position
@@ -595,6 +613,9 @@ class PGATActor(nn.Module):
                 neighbor_positions=neighbor_positions,
                 obstacle_positions=obstacle_positions
             )
+
+            agent_attended = self.gat_agent_norms[i](agent_attended)
+            obstacle_attended = self.gat_obstacle_norms[i](obstacle_attended)
             
             # Store final layer outputs
             if i == self.n_gnn_layers - 1:
@@ -620,6 +641,7 @@ class PGATActor(nn.Module):
         ], dim=-1)  # [batch_size * n_agents, 3 * gnn_hidden_dim]
         
         # Apply ReLU and dropout
+        combined_gat_output = self.combined_gat_norm(combined_gat_output)
         combined_gat_output = F.relu(combined_gat_output)
         combined_gat_output = F.dropout(combined_gat_output, p=0.1, training=self.training)
         
