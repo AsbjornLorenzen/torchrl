@@ -5,24 +5,26 @@ tags: []
 
 env:
   max_steps: 300
-  scenario_name: "potential_formation_img"
+  scenario_name: "potential_formation_movement"
   scenario:
-    n_agents: 8
+    n_agents: 10
     shared_rew: True
   device: ??? # These values will be populated dynamically
   vmas_envs: ???
 
 model:
+  gnn_hidden_dim: 128
+  gnn_layers: 2
+  k_neighbors: 2  # Number of agents in observation space
+  k_obstacles: 2  # Number of obstacles in observation space
+  n_attention_heads: 4
+  dropout: 0.0
+  agent_pos_indices: [0,2]
   shared_parameters: True
   centralised_critic: True  # MAPPO if True, IPPO if False
-  gnn_hidden_dim: 256
-  gnn_layers: 2
-  k_neighbours: 2
-  pos_indices: [0, 2]
-
 
 collector:
-  frames_per_batch: 6_000 # Frames sampled each sampling iteration
+  frames_per_batch: 12_000 # Frames sampled each sampling iteration
   n_iters: 500 # Number of sampling/training iterations
   total_frames: ???
 
@@ -30,22 +32,21 @@ buffer:
   memory_size: ???
 
 loss:
-  gamma: 0.995
+  gamma: 0.95
   lmbda: 0.95
-  entropy_eps: 0
+  entropy_eps: 0.1
   clip_epsilon: 0.2
 
 train:
-  num_epochs: 45  # optimization steps per batch of data collected
-  minibatch_size: 20 # size of minibatches used in each epoch
-  lr: 1e-6
-  max_grad_norm: 40.0
+  num_epochs: 10  # optimization steps per batch of data collected
+  minibatch_size: 100 # size of minibatches used in each epoch
+  lr: 1e-4
+  max_grad_norm: 0.5
   device: ???
 
 eval:
   evaluation_interval: 10
   evaluation_episodes: 20
-  render: True
 
 logger:
   backend: wandb # Delete to remove logging
@@ -55,3 +56,4 @@ logger:
 snapshots:
   save_dir: saves
   save_best_only: False
+

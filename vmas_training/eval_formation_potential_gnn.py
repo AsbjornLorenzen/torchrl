@@ -39,7 +39,7 @@ def load_model(model_path, model):
     return model
 
 
-@hydra.main(version_base="1.1", config_path="", config_name="mappo_gnn")
+@hydra.main(version_base="1.1", config_path="", config_name="eval_mappo_gat")
 def evaluate(cfg: DictConfig):
     # Add model_dir to config if not present
     if not hasattr(cfg, 'model_dir'):
@@ -135,7 +135,7 @@ def evaluate(cfg: DictConfig):
 
     # Load pre-trained model parameters
     if cfg.model_dir:
-        actor_path = os.path.join(cfg.model_dir, "model_snapshot_iter_230.pt")
+        actor_path = os.path.join(cfg.model_dir, "model_snapshot_iter_180.pt")
         critic_path = os.path.join(cfg.model_dir, "critic.pth")
         
         if os.path.exists(actor_path):
