@@ -5,7 +5,7 @@ tags: []
 
 env:
   max_steps: 300
-  scenario_name: "potential_formation_movement"
+  scenario_name: "eval_potential_formation_img"
   scenario:
     n_agents: 10
     shared_rew: True
@@ -45,8 +45,10 @@ train:
   device: ???
 
 eval:
-  evaluation_interval: 10
+  evaluation_interval: 1
   evaluation_episodes: 20
+  render: True
+  save_video: True
 
 logger:
   backend: wandb # Delete to remove logging
