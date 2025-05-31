@@ -110,7 +110,7 @@ class ObservationConfig:
     def get_new_query_indices(self) -> List[slice]:
         """Return indices for reference point features"""
         return [
-            # self.ego_agent_position_idx,
+            self.ego_agent_position_idx,
             self.ego_agent_velocity_idx,
             # self.ego_formation_vector_idx,
             self.ego_agent_ideal_dist_idx,
@@ -122,7 +122,7 @@ class ObservationConfig:
     def get_query_dim(self) -> int:
         """Get dimension for query (ego agent position)"""
         # return 11
-        return 3
+        return 5
 
     def get_grad_feature_dim(self) -> int:
         return 2
@@ -134,7 +134,7 @@ class ObservationConfig:
     def get_neighbor_value_dim(self) -> int:
         """Get dimension for neighbor values"""
         # vel(2) + vec_to_form(2) + progress(1) + relative_pos(2) = 7
-        return 7
+        return 10
     
     def get_obstacle_key_dim(self) -> int:
         """Get dimension for obstacle keys (positions)"""
@@ -142,7 +142,7 @@ class ObservationConfig:
     
     def get_obstacle_value_dim(self) -> int:
         """Get dimension for obstacle values (relative positions)"""
-        return 2
+        return 5
     
     def get_reference_point_feature_dim(self) -> int:
         """Get dimension for reference point features"""
@@ -260,10 +260,11 @@ class PGATCrossAttentionLayer(nn.Module):
             breakpoint()
         # Return both attended features separately
         return agent_attended, obstacle_attended
-    
+
+
     def _attend_to_agents(self, query, agent_key_features, agent_value_features, 
-                         agent_positions, neighbor_positions):
-        """Attend to neighboring agents"""
+                         agent_positions, neighbor_relative_positions):
+        """Attend to neighboring agents - FIXED for collision avoidance"""
         n_agents, k_neighbors = agent_key_features.shape[:2]
         H, C = self.heads, self.out_channels
         
@@ -271,49 +272,38 @@ class PGATCrossAttentionLayer(nn.Module):
         if k_neighbors == 0:
             return torch.zeros(n_agents, C, device=device)
 
-        # Reshape to process all neighbors at once: [n_agents * k_neighbors, feature_dim]
+        # Use relative positions directly for distance calculation
+        distances = torch.norm(neighbor_relative_positions, dim=-1, keepdim=True)
+        distances = torch.clamp(distances, min=1e-3)
+        
+        # FIXED: More attention to closer neighbors (inverse relationship)
+        # This encourages the network to pay more attention to collision threats
+        distance_weights = 1.0 / (torch.clamp(self.c_agent_decay, min=0.5, max=10.0) * distances)
+
+        # Alternative: Remove distance weighting entirely and let attention learn
+        # distance_weights = torch.ones_like(distances)
+        
+        # Rest of the attention mechanism...
         agent_key_flat = agent_key_features.reshape(-1, agent_key_features.shape[-1])
         agent_value_flat = agent_value_features.reshape(-1, agent_value_features.shape[-1])
         
-        # Transform keys and values
         agent_keys = self.lin_agent_key(agent_key_flat).reshape(n_agents, k_neighbors, H, C)
         agent_values = self.lin_agent_value(agent_value_flat).reshape(n_agents, k_neighbors, H, C)
         
-        # Calculate distance-based attention weights
-        # agent_positions: [n_agents, 2], neighbor_positions: [n_agents, k_neighbors, 2]
-        distances = torch.norm(
-            agent_positions.unsqueeze(1) - neighbor_positions, 
-            dim=-1, keepdim=True
-        )  # [n_agents, k_neighbors, 1]
-        
-        # Distance-based weights: exp(-c * distance)
-        distance_weights = torch.exp(-self.c_agent_decay * distances) + 1e-8 # [n_agents, k_neighbors, 1]
-
-        distances = torch.norm(agent_positions.unsqueeze(1) - neighbor_positions, dim=-1, keepdim=True)
-        distances = torch.clamp(distances, min=1e-3)  # Prevent division by zero
-        distance_weights = torch.exp(-self.c_agent_decay * distances)
-        
         # Dot-product attention
-        # query: [n_agents, H, C], agent_keys: [n_agents, k_neighbors, H, C]
-        dot_attention = torch.einsum('nhc,nkhc->nhk', query, agent_keys) * self.scale  # [n_agents, H, k_neighbors]
+        dot_attention = torch.einsum('nhc,nkhc->nhk', query, agent_keys) * self.scale
         
         # Combine with distance weights
-        # distance_weights: [n_agents, k_neighbors, 1] -> [n_agents, 1, k_neighbors]
-        combined_attention = dot_attention * distance_weights.squeeze(-1).unsqueeze(1)  # [n_agents, H, k_neighbors]
+        combined_attention = dot_attention * distance_weights.squeeze(-1).unsqueeze(1)
         
-        # Apply softmax
-        attention_weights = F.softmax(combined_attention, dim=-1)  # [n_agents, H, k_neighbors]
+        attention_weights = F.softmax(combined_attention, dim=-1)
         attention_weights = F.dropout(attention_weights, p=self.dropout, training=self.training)
         
-        # Apply attention to values
-        # attention_weights: [n_agents, H, k_neighbors], agent_values: [n_agents, k_neighbors, H, C]
-        attended = torch.einsum('nhk,nkhc->nhc', attention_weights, agent_values)  # [n_agents, H, C]
-        
-        # Project and aggregate across heads
+        attended = torch.einsum('nhk,nkhc->nhc', attention_weights, agent_values)
         attended = attended.reshape(n_agents, -1)
 
         return self.agent_proj(attended)
-    
+
     def _attend_to_obstacles(self, query, obstacle_key_features, obstacle_value_features,
                            agent_positions, obstacle_positions):
         """Attend to obstacles"""
@@ -432,6 +422,9 @@ class PGATActor(nn.Module):
             nn.Linear(self.other_ego_feature_dim, gnn_hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
+            nn.Linear(gnn_hidden_dim, gnn_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(gnn_hidden_dim, gnn_hidden_dim)
         ).to(self.device)
         
@@ -450,19 +443,33 @@ class PGATActor(nn.Module):
         # = 3 * gnn_hidden_dim + other_ego_feature_dim
         # TODO: FIX DIM
         output_mlp_input_dim = 3 * gnn_hidden_dim # + self.other_ego_feature_dim
-        
         self.output_mlp = nn.Sequential(
-            nn.Linear(output_mlp_input_dim, 128),
+            nn.Linear(output_mlp_input_dim, 2 * gnn_hidden_dim),  # 512
             nn.ReLU(),
             nn.Dropout(dropout),
-            # nn.Linear(256, 256), 
-            # nn.ReLU(),
-            # nn.Dropout(dropout),
-            nn.Linear(128, n_agent_outputs)
-        )
+            nn.Linear(2 * gnn_hidden_dim, gnn_hidden_dim),        # 256
+            nn.ReLU(), 
+            nn.Dropout(dropout),
+            nn.Linear(gnn_hidden_dim, gnn_hidden_dim // 2),       # 128
+            nn.ReLU(),
+            nn.Linear(gnn_hidden_dim // 2, n_agent_outputs)      # Final output
+        ) 
 
         # Initialize the network weights
         self._initialize_weights()
+
+        # Layer norm modules
+        self.gat_agent_norms = nn.ModuleList([
+            nn.LayerNorm(gnn_hidden_dim, device=self.device) 
+            for _ in range(n_gnn_layers)
+        ])
+        self.gat_obstacle_norms = nn.ModuleList([
+            nn.LayerNorm(gnn_hidden_dim, device=self.device) 
+            for _ in range(n_gnn_layers)
+        ])
+        self.ego_norm = nn.LayerNorm(gnn_hidden_dim, device=self.device)
+        self.combined_gat_norm = nn.LayerNorm(2 * gnn_hidden_dim, device=self.device)
+
 
     def _initialize_weights(self):
         """Custom weight initialization to bias towards higher outputs"""
@@ -471,7 +478,7 @@ class PGATActor(nn.Module):
         with torch.no_grad():
             # Set bias to positive values to encourage higher outputs
             # self.output_mlp[-1].bias.fill_(self.init_bias_value)
-            nn.init.normal_(self.output_mlp[-1].weight, mean=0.0, std=1.0)
+            nn.init.normal_(self.output_mlp[-1].weight, mean=0.0, std=0.05)
         
     def _calculate_feature_dim(self, slice_list: List[slice]) -> int:
         """Calculate total dimension from list of slices"""
@@ -487,55 +494,64 @@ class PGATActor(nn.Module):
             features.append(obs[..., s])
         return torch.cat(features, dim=-1)
 
+
     def _extract_neighbor_features(self, obs: torch.Tensor, ego_positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract neighbor key and value features - FIXED to use 7-dimensional neighbor blocks"""
+        """Extract neighbor key and value features - FIXED for proper collision avoidance"""
         batch_size = obs.shape[0]
         
-        # Extract neighbor block (now correctly sized for 7 dimensions per neighbor)
+        # Extract neighbor block
         neighbor_block = obs[:, self.obs_config.neighbor_block_raw_idx]
         neighbor_block = neighbor_block.reshape(batch_size, self.k_neighbors, self.obs_config.neighbor_obs_dim)
         
-        # Extract neighbor positions (keys) - Note: these are relative positions in the observation
-        neighbor_relative_positions = neighbor_block[:, :, self.obs_config.neighbor_positions_in_block_idx]  # [batch, k_neighbors, 2]
+        # Extract neighbor RELATIVE positions (don't convert to absolute)
+        neighbor_relative_positions = neighbor_block[:, :, self.obs_config.neighbor_positions_in_block_idx]
         
-        # Convert relative positions to absolute positions for distance calculations
-        neighbor_positions = neighbor_relative_positions + ego_positions.unsqueeze(1)  # [batch, k_neighbors, 2]
+        # For keys, use relative positions directly (spatial relationships matter more than absolute positions)
+        agent_key_features = neighbor_relative_positions  # [batch, k_neighbors, 2]
         
-        # Extract neighbor velocities and vec_to_form
-        neighbor_velocities = neighbor_block[:, :, self.obs_config.neighbor_velocities_in_block_idx]  # [batch, k_neighbors, 2]
-        neighbor_vec_to_form = neighbor_block[:, :, self.obs_config.neighbor_vec_to_form_in_block_idx]  # [batch, k_neighbors, 2]
+        # Extract other neighbor features
+        neighbor_velocities = neighbor_block[:, :, self.obs_config.neighbor_velocities_in_block_idx]
+        neighbor_vec_to_form = neighbor_block[:, :, self.obs_config.neighbor_vec_to_form_in_block_idx]
+        neighbor_progress = neighbor_block[:, :, self.obs_config.neighbor_progress_in_block_idx]
         
-        # Extract neighbor progress (now from within the neighbor block)
-        neighbor_progress = neighbor_block[:, :, self.obs_config.neighbor_progress_in_block_idx]  # [batch, k_neighbors, 1]
+        # Values: include relative positions, velocities, and collision-relevant info
+        distances = torch.norm(neighbor_relative_positions, dim=-1, keepdim=True)
+        unit_directions = neighbor_relative_positions / (distances + 1e-8)
         
-        # Keys: absolute positions (for distance calculations)
-        agent_key_features = neighbor_positions  # [batch, k_neighbors, 2]
-        
-        # Values: velocities + vec_to_form + progress + relative_positions
         agent_value_features = torch.cat([
-            neighbor_velocities,
+            neighbor_relative_positions,  # Where they are relative to me
+            distances,                    # How far they are (crucial for collision avoidance)
+            unit_directions,              # Which direction they are
+            neighbor_velocities,          # How they're moving
             neighbor_vec_to_form,
-            neighbor_progress,
-            neighbor_relative_positions  # Use relative positions in values
-        ], dim=-1)  # [batch, k_neighbors, 7]
+            neighbor_progress
+        ], dim=-1)  # [batch, k_neighbors, 9] instead of 7
         
-        return agent_key_features, agent_value_features, neighbor_positions
+        # Return relative positions for distance calculations
+        return agent_key_features, agent_value_features, neighbor_relative_positions
 
-    def _extract_obstacle_features(self, obs: torch.Tensor, ego_positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract obstacle key and value features"""
+    def _extract_obstacle_features(self, obs: torch.Tensor, ego_positions: torch.Tensor):
+        """Extract obstacle features - enhanced for collision avoidance"""
         batch_size = obs.shape[0]
         
-        # Extract obstacle positions
-        obstacle_positions = obs[:, self.obs_config.obstacle_positions_raw_idx]
-        obstacle_positions = obstacle_positions.reshape(batch_size, self.k_obstacles, 2)  # [batch, k_obstacles, 2]
+        # Extract obstacle positions (these should already be relative in your observation)
+        obstacle_relative_positions = obs[:, self.obs_config.obstacle_positions_raw_idx]
+        obstacle_relative_positions = obstacle_relative_positions.reshape(batch_size, self.k_obstacles, 2)
         
-        # Keys: positions
-        obstacle_key_features = obstacle_positions  # [batch, k_obstacles, 2]
+        # Keys: relative positions
+        obstacle_key_features = obstacle_relative_positions
         
-        # Values: relative positions
-        obstacle_value_features = obstacle_positions - ego_positions.unsqueeze(1)  # [batch, k_obstacles, 2]
+        # Values: enhanced with distance and direction info
+        distances = torch.norm(obstacle_relative_positions, dim=-1, keepdim=True)
+        unit_directions = obstacle_relative_positions / (distances + 1e-8)
         
-        return obstacle_key_features, obstacle_value_features, obstacle_positions
+        obstacle_value_features = torch.cat([
+            obstacle_relative_positions,  # Where they are
+            distances,                    # How far (crucial for collision avoidance)
+            unit_directions              # Which direction
+        ], dim=-1)  # [batch, k_obstacles, 5] instead of 2
+        
+        return obstacle_key_features, obstacle_value_features, obstacle_relative_positions
 
         
     def forward(self, agent_observations: torch.Tensor) -> torch.Tensor:
@@ -577,6 +593,7 @@ class PGATActor(nn.Module):
         # Process reference point features through MLP (once, outside the loop)
         # processed_ref_point_features = self.ref_point_mlp(ref_point_features_input)  # [batch_size * n_agents, gnn_hidden_dim]
         processed_ego_features = self.ego_mlp(other_ego_features_input)
+        processed_ego_features = self.ego_norm(processed_ego_features)
         
         # GAT layer processing
         current_query = query_input_L0  # Start with ego position
@@ -595,6 +612,9 @@ class PGATActor(nn.Module):
                 neighbor_positions=neighbor_positions,
                 obstacle_positions=obstacle_positions
             )
+
+            agent_attended = self.gat_agent_norms[i](agent_attended)
+            obstacle_attended = self.gat_obstacle_norms[i](obstacle_attended)
             
             # Store final layer outputs
             if i == self.n_gnn_layers - 1:
@@ -620,6 +640,7 @@ class PGATActor(nn.Module):
         ], dim=-1)  # [batch_size * n_agents, 3 * gnn_hidden_dim]
         
         # Apply ReLU and dropout
+        combined_gat_output = self.combined_gat_norm(combined_gat_output)
         combined_gat_output = F.relu(combined_gat_output)
         combined_gat_output = F.dropout(combined_gat_output, p=0.1, training=self.training)
         
