@@ -16,8 +16,8 @@ env:
 model:
   gnn_hidden_dim: 128
   gnn_layers: 2
-  k_neighbors: 2  # Number of agents in observation space
-  k_obstacles: 2  # Number of obstacles in observation space
+  k_neighbors: 4  # Number of agents in observation space
+  k_obstacles: 4  # Number of obstacles in observation space
   n_attention_heads: 4
   dropout: 0.0
   agent_pos_indices: [0,2]
