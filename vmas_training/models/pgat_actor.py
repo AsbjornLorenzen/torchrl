@@ -18,7 +18,7 @@ class ObservationConfig:
         # Other Ego-Agent Features (to be concatenated after PGAT output)
         self.ego_agent_velocity_idx = slice(2, 4)  # [vx, vy] velocity
         self.ego_grad_agents_idx = slice(4, 6)
-        self.ego_grad_vol_idx = slice(6, 8)
+        self.ref_point_vel_idx = slice(6, 8)
         self.ego_grad_obs_idx = slice(8, 10)
         self.ego_grad_form_idx = slice(10, 12)
         
@@ -87,7 +87,7 @@ class ObservationConfig:
         return [
             # NOTE: In modified env, grad_agents is actually all grads summed
             self.ego_grad_agents_idx,
-            # self.ego_grad_vol_idx,
+            # self.ref_point_vel_idx,
             # self.ego_grad_obs_idx,
             # self.ego_grad_form_idx,
         ]
@@ -97,14 +97,14 @@ class ObservationConfig:
         return [
             # self.ego_agent_velocity_idx,
             self.ego_grad_agents_idx,
-            self.ego_grad_vol_idx,
+            self.ref_point_vel_idx,
             # self.ego_grad_obs_idx,
             # self.ego_grad_form_idx,
             # self.ego_agent_ideal_dist_idx,
             # self.ego_goal_vector_idx,
             self.ego_formation_vector_idx,
-            self.ego_vel_to_form_idx,
-            self.ego_progress_idx,
+            # self.ego_vel_to_form_idx,
+            # self.ego_progress_idx,
         ]
 
     def get_new_query_indices(self) -> List[slice]:
@@ -153,7 +153,7 @@ class ObservationConfig:
         """Get dimension for other ego features"""
         # grad_agents(2) + grad_vol(2) + grad_obs(2) + 
         # grad_form(2) + ideal_dist(1) + goal_vector(2) = 13
-        return 8
+        return 6
 
 
 class PGATCrossAttentionLayer(nn.Module):

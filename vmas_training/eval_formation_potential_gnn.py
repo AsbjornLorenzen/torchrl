@@ -325,7 +325,7 @@ def evaluate(cfg: DictConfig):
         with torch.no_grad():
             training_episode_metrics = extract_episode_metrics(rollouts, env_test)
 
-        add_detailed_logging_to_eval()
+        # add_detailed_logging_to_eval()
 
         # Log evaluation results
         if cfg.logger.backend:

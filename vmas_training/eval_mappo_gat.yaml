@@ -2,13 +2,16 @@ seed: 0
 model_dir: "/workspace/torchrl/outputs/2025-05-29/23-31-56/snapshots"
 run_description: null
 tags: []
+checkpoint_path: "/workspace/torchrl/outputs/2025-06-05/01-07-00/snapshots/model_snapshot_iter_100.pt"
+resume_training: True
 
 env:
-  max_steps: 300
-  scenario_name: "eval_potential_formation_img"
+  max_steps: 500
+  scenario_name: "eval_modes"
   scenario:
     n_agents: 10
     shared_rew: True
+    mode: "basic"
   device: ??? # These values will be populated dynamically
   vmas_envs: ???
 

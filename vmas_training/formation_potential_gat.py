@@ -8,6 +8,7 @@ import time
 import os
 import hydra
 import torch
+import random
 from datetime import datetime
 
 from tensordict.nn import TensorDictModule
@@ -181,7 +182,9 @@ def train(cfg: "DictConfig"):  # noqa: F821
     cfg.env.device = cfg.train.device
 
     # Seeding
-    torch.manual_seed(cfg.seed)
+    random_seed = random.randint(0, 2**32 - 1)
+
+    torch.manual_seed(random_seed)
 
     # Sampling
     cfg.env.vmas_envs = cfg.collector.frames_per_batch // cfg.env.max_steps
@@ -199,7 +202,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         continuous_actions=True,
         max_steps=cfg.env.max_steps,
         device=cfg.env.device,
-        seed=cfg.seed,
+        seed=random_seed,
         # Scenario kwargs
         **cfg.env.scenario,
     )
@@ -214,7 +217,7 @@ def train(cfg: "DictConfig"):  # noqa: F821
         continuous_actions=True,
         max_steps=cfg.env.max_steps,
         device=cfg.env.device,
-        seed=cfg.seed,
+        seed=random_seed,
         # Scenario kwargs
         **cfg.env.scenario,
     )

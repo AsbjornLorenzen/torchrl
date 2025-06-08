@@ -1,9 +1,11 @@
 seed: 0
 run_description: null
 tags: []
+checkpoint_path: "/workspace/torchrl/outputs/2025-06-05/01-07-00/snapshots/model_snapshot_iter_100.pt"
+resume_training: True
 
 env:
-  max_steps: 300
+  max_steps: 500
   scenario_name: "potential_formation_movement"
   scenario:
     n_agents: 8
@@ -31,7 +33,7 @@ buffer:
   memory_size: ???
 
 loss:
-  gamma: 0.95
+  gamma: 0.995
   lmbda: 0.95
   entropy_eps: 0.1
   clip_epsilon: 0.2
