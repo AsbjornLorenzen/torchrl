@@ -19,7 +19,7 @@ model:
   k_neighbors: 4  # Number of agents in observation space
   k_obstacles: 4  # Number of obstacles in observation space
   n_attention_heads: 4
-  dropout: 0.0
+  dropout: 0.1
   agent_pos_indices: [0,2]
   shared_parameters: True
   centralised_critic: True  # MAPPO if True, IPPO if False

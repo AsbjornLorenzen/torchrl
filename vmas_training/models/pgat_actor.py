@@ -41,7 +41,7 @@ class ObservationConfig:
         
         # Reference Point Features (Ego-Agent's relation to its formation goal) - FIXED: Updated starting index
         ref_point_features_start_idx = end_neighbor_obstacle_block + 3
-        self.ego_formation_vector_idx = slice(ref_point_features_start_idx, ref_point_features_start_idx + 2)
+        self.ego_guiding_vector_idx = slice(ref_point_features_start_idx, ref_point_features_start_idx + 2)
         self.ego_vel_to_form_idx = slice(ref_point_features_start_idx + 2, ref_point_features_start_idx + 3)
         self.ego_progress_idx = slice(ref_point_features_start_idx + 3, ref_point_features_start_idx + 4)
         
@@ -59,25 +59,14 @@ class ObservationConfig:
         # We'll extract positions from the neighbor block in PGATActor
         return [self.neighbor_block_raw_idx]
     
-    def get_neighbor_value_indices(self) -> List[slice]:
-        """Return indices for neighbor value features"""
-        # Values include velocities, vec_to_form, progress
-        # Relative positions will be computed on-the-fly
-        return [self.neighbor_block_raw_idx]  # REMOVED neighbor_progress_raw_idx since it's now in the block
-    
     def get_obstacle_key_indices(self) -> List[slice]:
         """Return indices for obstacle positions (keys)"""
-        return [self.obstacle_positions_raw_idx]
-    
-    def get_obstacle_value_indices(self) -> List[slice]:
-        """Return indices for obstacle value features"""
-        # Values will be relative positions computed on-the-fly
         return [self.obstacle_positions_raw_idx]
     
     def get_reference_point_feature_indices(self) -> List[slice]:
         """Return indices for reference point features"""
         return [
-            self.ego_formation_vector_idx,
+            self.ego_guiding_vector_idx,
             self.ego_vel_to_form_idx,
             self.ego_progress_idx
         ]
@@ -102,7 +91,7 @@ class ObservationConfig:
             # self.ego_grad_form_idx,
             # self.ego_agent_ideal_dist_idx,
             # self.ego_goal_vector_idx,
-            self.ego_formation_vector_idx,
+            self.ego_guiding_vector_idx,
             # self.ego_vel_to_form_idx,
             # self.ego_progress_idx,
         ]
@@ -112,7 +101,7 @@ class ObservationConfig:
         return [
             self.ego_agent_position_idx,
             self.ego_agent_velocity_idx,
-            # self.ego_formation_vector_idx,
+            # self.ego_guiding_vector_idx,
             self.ego_agent_ideal_dist_idx,
             # self.ego_goal_vector_idx,
             # self.ego_vel_to_form_idx,
@@ -278,7 +267,9 @@ class PGATCrossAttentionLayer(nn.Module):
         
         # FIXED: More attention to closer neighbors (inverse relationship)
         # This encourages the network to pay more attention to collision threats
-        distance_weights = 1.0 / (torch.clamp(self.c_agent_decay, min=0.5, max=10.0) * distances)
+        # distance_weights = 1.0 / (torch.clamp(self.c_agent_decay, min=0.5, max=10.0) * distances)
+
+        distance_weights = torch.exp(-torch.clamp(self.c_agent_decay,min=0.5,max=10.0) * distances)  # [n_agents, k_obstacles, 1]
 
         # Alternative: Remove distance weighting entirely and let attention learn
         # distance_weights = torch.ones_like(distances)
@@ -318,11 +309,9 @@ class PGATCrossAttentionLayer(nn.Module):
         obstacle_values = self.lin_obstacle_value(obstacle_value_features).reshape(n_agents, k_obstacles, H, C)
         
         # Calculate distance-based attention weights
-        distances = torch.norm(
-            agent_positions.unsqueeze(1) - obstacle_positions, 
-            dim=-1, keepdim=True
-        )  # [n_agents, k_obstacles, 1]
-        
+        distances = torch.norm(obstacle_positions, dim=-1, keepdim=True)
+        distances = torch.clamp(distances, min=1e-3)
+    
         distance_weights = torch.exp(-self.c_obstacle_decay * distances)  # [n_agents, k_obstacles, 1]
         
         # Dot-product attention  
