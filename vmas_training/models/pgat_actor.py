@@ -19,8 +19,8 @@ class ObservationConfig:
         self.ego_agent_velocity_idx = slice(2, 4)  # [vx, vy] velocity
         self.ego_grad_agents_idx = slice(4, 6)
         self.ref_point_vel_idx = slice(6, 8)
-        self.ego_grad_obs_idx = slice(8, 10)
-        self.ego_grad_form_idx = slice(10, 12)
+        self.ego_form_vec_idx = slice(8, 10)
+        self.ego_vor_vec_idx = slice(10, 12)
         
         # Neighbor Features (for Keys & Values) - FIXED: Each neighbor has 7 dimensions
         self.neighbor_block_raw_idx = slice(12, 12 + k_neighbors * 7)  # Changed from * 6 to * 7
@@ -77,21 +77,21 @@ class ObservationConfig:
             # NOTE: In modified env, grad_agents is actually all grads summed
             self.ego_grad_agents_idx,
             # self.ref_point_vel_idx,
-            # self.ego_grad_obs_idx,
-            # self.ego_grad_form_idx,
+            # self.ego_form_vec_idx,
+            # self.ego_vor_vec_idx,
         ]
     
     def get_other_ego_feature_indices(self) -> List[slice]:
         """Return indices for other ego-agent features"""
         return [
             # self.ego_agent_velocity_idx,
-            self.ego_grad_agents_idx,
+            # self.ego_grad_agents_idx, # THIS IS THE GRAD INDEX WE NEED TO INCLUDE
             self.ref_point_vel_idx,
-            # self.ego_grad_obs_idx,
-            # self.ego_grad_form_idx,
+            self.ego_form_vec_idx,
+            self.ego_vor_vec_idx,
             # self.ego_agent_ideal_dist_idx,
             # self.ego_goal_vector_idx,
-            self.ego_guiding_vector_idx,
+            # self.ego_guiding_vector_idx,
             # self.ego_vel_to_form_idx,
             # self.ego_progress_idx,
         ]
