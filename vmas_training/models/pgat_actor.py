@@ -89,7 +89,7 @@ class ObservationConfig:
             self.ref_point_vel_idx,
             self.ego_form_vec_idx,
             self.ego_vor_vec_idx,
-            # self.ego_agent_ideal_dist_idx,
+            self.ego_agent_ideal_dist_idx,
             # self.ego_goal_vector_idx,
             # self.ego_guiding_vector_idx,
             # self.ego_vel_to_form_idx,
@@ -142,7 +142,7 @@ class ObservationConfig:
         """Get dimension for other ego features"""
         # grad_agents(2) + grad_vol(2) + grad_obs(2) + 
         # grad_form(2) + ideal_dist(1) + goal_vector(2) = 13
-        return 6
+        return 7
 
 
 class PGATCrossAttentionLayer(nn.Module):
